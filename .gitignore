@@ -3,3 +3,6 @@ archive/*.md
 logs/*
 !archive/.gitkeep
 !logs/.gitkeep
+
+# Runtime state on the box (bind-mounted into the container)
+data/

@@ -2,10 +2,16 @@
 #
 # Generate the morning briefing and email it.
 #
-# Run from cron with the environment sourced first — cron's environment is
-# nearly empty, so PATH and the tokens must come from .env:
+# In production this is the container entrypoint, fired by host cron:
 #
-#   30 5 * * 1-5 . /opt/briefing/.env && /opt/briefing/run.sh >> /opt/briefing/logs/cron.log 2>&1
+#   docker compose --profile cron run --rm briefing
+#
+# Compose loads .env via env_file, so the container gets a complete environment
+# regardless of how sparse cron's own environment is.
+#
+# Locally, run it directly (./run.sh) after exporting the vars in .env.example.
+# With RESEND_API_KEY unset it writes the briefing and skips the email, which is
+# the right loop for tuning prompt.md.
 
 set -euo pipefail
 

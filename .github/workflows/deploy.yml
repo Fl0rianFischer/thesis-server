@@ -1,0 +1,91 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: production
+          push: true
+          tags: |
+            ghcr.io/fl0rianfischer/morning-briefing:${{ github.sha }}
+            ghcr.io/fl0rianfischer/morning-briefing:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+          # Variables (non-sensitive)
+          TZ: ${{ vars.TZ }}
+          MAIL_FROM: ${{ vars.MAIL_FROM }}
+          MAIL_TO: ${{ vars.MAIL_TO }}
+          BRIEFING_MODEL: ${{ vars.BRIEFING_MODEL }}
+          BRIEFING_EFFORT: ${{ vars.BRIEFING_EFFORT }}
+          BRIEFING_MAX_TURNS: ${{ vars.BRIEFING_MAX_TURNS }}
+          BRIEFING_CRON: ${{ vars.BRIEFING_CRON }}
+          # Secrets (masked)
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: IMAGE_TAG,TZ,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_CRON,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY
+          script: |
+            set -e
+            cd /opt/briefing
+            git pull --ff-only
+
+            mkdir -p data/archive data/logs
+
+            cat > .env <<ENVEOF
+            IMAGE_TAG=$IMAGE_TAG
+            TZ=$TZ
+            MAIL_FROM=$MAIL_FROM
+            MAIL_TO=$MAIL_TO
+            BRIEFING_MODEL=$BRIEFING_MODEL
+            BRIEFING_EFFORT=$BRIEFING_EFFORT
+            BRIEFING_MAX_TURNS=$BRIEFING_MAX_TURNS
+            CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN
+            RESEND_API_KEY=$RESEND_API_KEY
+            ENVEOF
+            chmod 600 .env
+
+            docker compose pull
+            docker image prune -f
+
+            # Reinstall the cron entry on every deploy so the schedule is
+            # config, not something that drifts on the box. Tagged with a
+            # marker comment so replacing it is idempotent.
+            CRON_LINE="${BRIEFING_CRON:-30 5 * * 1-5} cd /opt/briefing && /usr/bin/docker compose --profile cron run --rm briefing >> /opt/briefing/data/logs/cron.log 2>&1 # morning-briefing"
+            ( crontab -l 2>/dev/null | grep -v '# morning-briefing$' || true; echo "$CRON_LINE" ) | crontab -
+            echo "cron installed:"
+            crontab -l | grep '# morning-briefing$'

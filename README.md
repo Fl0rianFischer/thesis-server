@@ -12,12 +12,24 @@ long-lived OAuth token.
 ## How it works
 
 ```
-cron (05:30)  →  run.sh  →  claude -p  →  archive/YYYY-MM-DD.md  →  Resend  →  inbox
+push to main  →  GitHub Actions  →  GHCR image  →  ssh deploy  →  /opt/briefing
+
+host cron (05:30)  →  docker compose run --rm briefing
+                         →  claude -p
+                         →  data/archive/YYYY-MM-DD.md
+                         →  Resend  →  inbox
 ```
 
 `prompt.md` is the system prompt. `watchlist.md` is what it filters news
-against. `archive/` is the memory: past briefings it reads before writing a new
-one.
+against. Both are baked into the image, so changing your holdings is a commit
+and a deploy — versioned and revertible like anything else.
+
+`data/archive/` on the box is the memory: past briefings the agent reads before
+writing a new one. It's a bind-mounted volume, so it survives redeploys. Losing
+it means every morning starts cold.
+
+There is no long-running service. The container is ephemeral — cron fires it,
+it writes a briefing, it exits.
 
 ## Setup
 
@@ -48,35 +60,52 @@ On a machine with a browser (your laptop, not the server):
 claude setup-token
 ```
 
-It prints a long-lived OAuth token and does **not** save it. Copy it now.
+It prints a long-lived OAuth token and does **not** save it. Copy it into the
+`CLAUDE_CODE_OAUTH_TOKEN` repository secret.
 
-### 4. Deploy
+### 4. Configure GitHub
+
+**Secrets** (Settings → Secrets and variables → Actions):
+
+| Secret | What |
+|---|---|
+| `CLAUDE_CODE_OAUTH_TOKEN` | From `claude setup-token` |
+| `RESEND_API_KEY` | Resend API key |
+| `SSH_HOST` / `SSH_USER` / `SSH_PRIVATE_KEY` | The box (reused from the old deploy) |
+
+**Variables:**
+
+| Variable | Example |
+|---|---|
+| `TZ` | `Europe/Berlin` |
+| `MAIL_FROM` | `briefing@yourdomain.example` |
+| `MAIL_TO` | `you@example.com` |
+| `BRIEFING_MODEL` | `sonnet` |
+| `BRIEFING_EFFORT` | `medium` |
+| `BRIEFING_MAX_TURNS` | `40` |
+| `BRIEFING_CRON` | `30 5 * * 1-5` |
+
+### 5. Prepare the box, once
 
 ```bash
-rsync -av --exclude .git --exclude .env ./ root@YOUR_BOX:/opt/briefing/
+sudo git clone https://github.com/fl0rianfischer/morning-briefing.git /opt/briefing
 ```
 
-On the box: install Claude Code, copy `.env.example` to `.env`, fill it in, and
-confirm auth works.
+The checkout only supplies `docker-compose.yml` — everything else ships in the
+image. Confirm Docker can pull from GHCR (`docker login ghcr.io` with a PAT
+carrying `read:packages`, if the package is private).
+
+### 6. Push to main
+
+The workflow builds the image, writes `/opt/briefing/.env`, pulls, and installs
+the cron entry. The schedule comes from `BRIEFING_CRON` and is reinstalled on
+every deploy, so it can't drift on the box.
+
+Trigger a run by hand to check the whole path end to end — this one does send
+the email:
 
 ```bash
-claude auth status --text
-```
-
-Set the box timezone so `date +%F` and the cron hour mean what you think:
-
-```bash
-timedatectl set-timezone Europe/Berlin
-```
-
-### 5. Schedule it
-
-```bash
-crontab -e
-```
-
-```
-30 5 * * 1-5 . /opt/briefing/.env && /opt/briefing/run.sh >> /opt/briefing/logs/cron.log 2>&1
+cd /opt/briefing && docker compose --profile cron run --rm briefing
 ```
 
 ## Design notes
@@ -96,27 +125,45 @@ servers in the working directory and `~/.claude` — keep the box clean.
 in-run failures, including expired auth, as the result on stdout. `run.sh`
 checks that `archive/<date>.md` exists and is non-empty; that's the real signal.
 
+**Ephemeral container, not a scheduled service.** Host cron runs
+`docker compose run --rm`. No cron daemon in the image, no supervisor, nothing
+to keep alive — and the thing cron runs is exactly the thing you can run by
+hand. `profiles: [cron]` keeps a stray `docker compose up -d` from firing a
+briefing as a side effect of poking at the box.
+
+**Compose supplies the environment.** The classic cron failure — empty `PATH`,
+missing tokens — doesn't apply, because `env_file: [.env]` is read by Compose
+rather than inherited from cron. The installed entry only needs an absolute path
+to `docker`.
+
 ## Troubleshooting
 
-**Nothing arrives, and it worked by hand.** Almost always cron's empty
-environment. Check `PATH` in `.env` points at wherever `which claude` reports on
-the box, and that the crontab line sources `.env` before running.
+**Nothing arrives.** Check `data/logs/cron.log`, then `data/logs/<date>.json`
+for the run itself. On failure `run.sh` logs a `FAILED` line plus the first 500
+characters of Claude's result, which is usually the whole answer.
 
 **It stops working after weeks of running.** The OAuth token expired. Re-run
-`claude setup-token` and update `.env` before debugging anything else.
+`claude setup-token`, update the `CLAUDE_CODE_OAUTH_TOKEN` secret, and redeploy
+— check this before debugging anything else.
 
 **It's eating your usage limits.** A 30–40 turn research run is a real chunk of
 a Pro budget and competes with your own Claude Code usage. Lower
 `BRIEFING_MAX_TURNS`, drop `BRIEFING_EFFORT` to `low`, or run three mornings a
-week (`30 5 * * 1,3,5`). If it's still tight, the ladder is Max, or API billing
-with `ANTHROPIC_API_KEY` — around $22/month on `sonnet` with these caps.
+week (`BRIEFING_CRON=30 5 * * 1,3,5`). If it's still tight, the ladder is Max,
+or API billing with `ANTHROPIC_API_KEY` — around $22/month on `sonnet` with
+these caps.
 
 **The briefing is padded or repetitive.** Tighten the thesis lines in
 `watchlist.md` and extend the "Not interesting" list. That fixes it far more
 reliably than editing `prompt.md`.
 
+**`docker compose pull` fails on the box.** The GHCR package is private by
+default and is a *different* package from the old `thesis-server` one. Either
+make it public, or `docker login ghcr.io` with a PAT carrying `read:packages`.
+
 ## Cost
 
 On a Claude Pro subscription: **$0 marginal** — it draws on usage limits rather
-than per-token billing. `logs/<date>.json` records `total_cost_usd` per run, so
-you can see what an equivalent API run would have cost if you ever switch.
+than per-token billing. `data/logs/<date>.json` records `total_cost_usd` per
+run, so you can see what an equivalent API run would have cost if you ever
+switch to `ANTHROPIC_API_KEY`.
