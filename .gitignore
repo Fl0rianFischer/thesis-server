@@ -1,0 +1,5 @@
+.env
+archive/*.md
+logs/*
+!archive/.gitkeep
+!logs/.gitkeep
