@@ -36,6 +36,29 @@ log() { printf '%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$*"; }
 # --bare is deliberately NOT used. It would ignore the subscription OAuth token
 # and fall back to ANTHROPIC_API_KEY billing, and it strips WebSearch/WebFetch
 # from the toolset, which is the entire job.
+# A setup-token is valid for one year and expires with no warning: Claude Code's
+# "login expires in 3 days" notice fires only for an interactive /login, not for
+# CLAUDE_CODE_OAUTH_TOKEN. Without this the first symptom is a briefing that
+# silently stops arriving. Set CLAUDE_TOKEN_ISSUED=YYYY-MM-DD to get a month's
+# notice; leave it unset to skip the check.
+if [ -n "${CLAUDE_TOKEN_ISSUED:-}" ]; then
+  IFS=- read -r _ty _tm _td <<< "$CLAUDE_TOKEN_ISSUED"
+  _wy=$((10#$_ty + 1)); _wm=$((10#$_tm - 1))
+  [ "$_wm" -eq 0 ] && { _wm=12; _wy=$((_wy - 1)); }
+  if [[ "$DATE" > "$(printf '%04d-%02d-%02d' "$_wy" "$_wm" "$((10#$_td))")" ]]; then
+    log "WARNING: OAuth token issued $CLAUDE_TOKEN_ISSUED expires around $((10#$_ty + 1))-$_tm-$_td."
+    log "WARNING: run 'claude setup-token', update the CLAUDE_CODE_OAUTH_TOKEN secret, redeploy."
+  fi
+fi
+
+# CLAUDE_CODE_OAUTH_TOKEN sits at #5 in Claude Code's auth precedence, below
+# both of these. If either leaks into the environment it wins silently and the
+# run bills the API instead of the subscription.
+if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
+  log "WARNING: ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN is set and outranks the"
+  log "WARNING: subscription token — this run will be billed to the API."
+fi
+
 log "starting briefing for $DATE (model=$MODEL effort=$EFFORT)"
 
 claude -p "Produce today's briefing." \

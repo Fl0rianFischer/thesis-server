@@ -54,8 +54,31 @@ On a machine with a browser (your laptop, not the server):
 claude setup-token
 ```
 
-It prints a long-lived OAuth token and does **not** save it. Copy it into the
+It opens the same browser flow as `/login` and prints an OAuth token to the
+terminal. It **saves it nowhere** — copy it straight into the
 `CLAUDE_CODE_OAUTH_TOKEN` repository secret.
+
+| | |
+|---|---|
+| **Valid for** | One year |
+| **Requires** | Pro, Max, Team, or Enterprise |
+| **Tied to** | The subscription of whoever ran the command — it draws on their usage limits |
+| **Can do** | Model requests only. No Remote Control, no claude.ai connectors. Locally configured MCP servers still work |
+
+**It expires silently.** Claude Code's "login expires in 3 days" warning fires
+only for an interactive `/login`, not for `CLAUDE_CODE_OAUTH_TOKEN`. About a
+year from now the briefing would just stop arriving with nothing to explain it.
+Set the `CLAUDE_TOKEN_ISSUED` variable to today's date and `run.sh` will warn
+you in the logs a month before it lapses. A calendar reminder is worth setting
+too.
+
+To rotate: re-run `claude setup-token`, update the secret, bump
+`CLAUDE_TOKEN_ISSUED`, redeploy.
+
+> **Never set `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN` on the box.** Both
+> outrank `CLAUDE_CODE_OAUTH_TOKEN` in Claude Code's auth precedence (#2 and #3
+> versus #5), so either one silently moves your runs onto API billing. `run.sh`
+> logs a warning if it sees them.
 
 ### 4. Configure GitHub
 
@@ -72,6 +95,7 @@ It prints a long-lived OAuth token and does **not** save it. Copy it into the
 | Variable | Example |
 |---|---|
 | `TZ` | `Europe/Berlin` |
+| `CLAUDE_TOKEN_ISSUED` | `2026-08-06` (date you ran `claude setup-token`) |
 | `MAIL_FROM` | `briefing@yourdomain.example` |
 | `MAIL_TO` | `you@example.com` |
 | `BRIEFING_MODEL` | `sonnet` |

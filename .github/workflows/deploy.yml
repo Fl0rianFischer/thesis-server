@@ -45,6 +45,7 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
           # Variables (non-sensitive)
           TZ: ${{ vars.TZ }}
+          CLAUDE_TOKEN_ISSUED: ${{ vars.CLAUDE_TOKEN_ISSUED }}
           MAIL_FROM: ${{ vars.MAIL_FROM }}
           MAIL_TO: ${{ vars.MAIL_TO }}
           BRIEFING_MODEL: ${{ vars.BRIEFING_MODEL }}
@@ -58,7 +59,7 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE_TAG,TZ,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_CRON,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY
+          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_CRON,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY
           script: |
             set -e
             cd /opt/briefing
@@ -69,6 +70,7 @@ jobs:
             cat > .env <<ENVEOF
             IMAGE_TAG=$IMAGE_TAG
             TZ=$TZ
+            CLAUDE_TOKEN_ISSUED=$CLAUDE_TOKEN_ISSUED
             MAIL_FROM=$MAIL_FROM
             MAIL_TO=$MAIL_TO
             BRIEFING_MODEL=$BRIEFING_MODEL
