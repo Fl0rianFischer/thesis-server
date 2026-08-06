@@ -7,7 +7,7 @@ FROM node:22-bookworm-slim AS production
 
 ENV NODE_ENV=production \
     HOME=/home/briefing \
-    TZ=Europe/Berlin
+    TZ=Asia/Jakarta
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \

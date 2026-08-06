@@ -87,7 +87,25 @@ jobs:
             # Reinstall the cron entry on every deploy so the schedule is
             # config, not something that drifts on the box. Tagged with a
             # marker comment so replacing it is idempotent.
-            CRON_LINE="${BRIEFING_CRON:-30 5 * * 1-5} cd /opt/briefing && /usr/bin/docker compose --profile cron run --rm briefing >> /opt/briefing/data/logs/cron.log 2>&1 # morning-briefing"
-            ( crontab -l 2>/dev/null | grep -v '# morning-briefing$' || true; echo "$CRON_LINE" ) | crontab -
+            #
+            # CRON_TZ makes the schedule explicit: without it cron uses the
+            # host timezone, and TZ in .env only affects `date` *inside* the
+            # container. A UTC box would fire "0 5" at noon Jakarta with
+            # nothing anywhere to explain it. CRON_TZ takes no trailing
+            # comment — cron reads the rest of the line as the value — so it
+            # is matched by prefix instead.
+            CRON_LINE="${BRIEFING_CRON:-0 5 * * 1-5} cd /opt/briefing && /usr/bin/docker compose --profile cron run --rm briefing >> /opt/briefing/data/logs/cron.log 2>&1 # morning-briefing"
+            ( crontab -l 2>/dev/null | grep -v '# morning-briefing$' | grep -v '^CRON_TZ=' || true
+              echo "CRON_TZ=${TZ:-Asia/Jakarta}"
+              echo "$CRON_LINE" ) | crontab -
             echo "cron installed:"
-            crontab -l | grep '# morning-briefing$'
+            crontab -l | grep -E '^CRON_TZ=|# morning-briefing$'
+
+            # Belt and braces: CRON_TZ is supported by Debian/Ubuntu cron but
+            # not universally, so check the host clock agrees too.
+            HOST_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo unknown)"
+            if [ "$HOST_TZ" != "${TZ:-Asia/Jakarta}" ]; then
+              echo "WARNING: host timezone is '$HOST_TZ', schedule expects '${TZ:-Asia/Jakarta}'."
+              echo "WARNING: CRON_TZ should cover this, but to be certain run:"
+              echo "WARNING:   sudo timedatectl set-timezone ${TZ:-Asia/Jakarta}"
+            fi
