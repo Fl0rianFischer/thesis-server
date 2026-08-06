@@ -42,15 +42,9 @@ just as much.
 
 ### 2. Try it locally first
 
-Before touching the server, run it by hand a few mornings and tune `prompt.md`.
-This is where the quality actually comes from.
-
-```bash
-./run.sh
-```
-
-Without `RESEND_API_KEY` set it writes `archive/<date>.md` and stops, which is
-what you want while iterating.
+See [Testing locally](#testing-locally) below. Do this before touching the
+server — the prompt is where the quality comes from, and tuning it through a
+cron log is miserable.
 
 ### 3. Generate a subscription token
 
@@ -106,6 +100,91 @@ the email:
 
 ```bash
 cd /opt/briefing && docker compose --profile cron run --rm briefing
+```
+
+## Testing locally
+
+Four rungs, cheapest first. Don't skip to the bottom — each one isolates a
+different failure.
+
+### 1. The prompt, no Docker
+
+Fastest loop, and the only one that matters for output quality. Uses your
+existing interactive Claude Code login, so no token needed.
+
+```bash
+set -a; . ./.env; set +a
+```
+
+```bash
+./run.sh
+```
+
+With `RESEND_API_KEY` empty it writes `archive/<date>.md` and stops. Read it,
+edit `watchlist.md` and `prompt.md`, delete the file, run again. Expect several
+rounds — the thesis lines and the "Not interesting" list do most of the work.
+
+To iterate without waiting for a full research run, cap it:
+
+```bash
+BRIEFING_MAX_TURNS=8 BRIEFING_EFFORT=low ./run.sh
+```
+
+### 2. The image builds and Claude runs in it
+
+This is where the genuinely unknown parts are: whether Claude Code installs
+cleanly, runs as a non-root user, and finds a writable `HOME` in the container.
+
+Needs a real `CLAUDE_CODE_OAUTH_TOKEN` in `.env` — the container can't reach
+your host's login. Generate one with `claude setup-token`.
+
+```bash
+docker build -t ghcr.io/fl0rianfischer/morning-briefing:local .
+```
+
+Then a five-second smoke test that skips the briefing entirely and just proves
+the image and auth work:
+
+```bash
+docker compose --profile cron run --rm --entrypoint claude briefing -p "Reply with OK and nothing else." --model haiku
+```
+
+If that prints `OK`, the image, the token, and network egress are all fine. If
+it doesn't, nothing below will work — fix it here.
+
+### 3. A real run through Compose
+
+Same command cron will use on the box:
+
+```bash
+docker compose --profile cron run --rm briefing
+```
+
+Check `data/archive/` for the briefing and `data/logs/<date>.json` for the run
+metadata. This also verifies the volume mounts — if the briefing lands inside
+the container instead of `data/archive/`, the mount is wrong and every morning
+would start with no memory.
+
+### 4. The email path
+
+Test it on its own rather than through a full run:
+
+```bash
+curl -fsS https://api.resend.com/emails -H "Authorization: Bearer $RESEND_API_KEY" -H "Content-Type: application/json" -d '{"from":"briefing@yourdomain.example","to":["you@example.com"],"subject":"test","text":"hello"}'
+```
+
+Most failures here are Resend domain verification, not the script.
+
+### Testing the deploy itself
+
+The workflow only runs on push to `main`, so use a scratch branch and
+`workflow_dispatch` from the Actions tab to trigger it without merging.
+
+The one thing you can't rehearse locally is cron on the box. After the first
+deploy, confirm the entry landed:
+
+```bash
+crontab -l | grep morning-briefing
 ```
 
 ## Design notes
