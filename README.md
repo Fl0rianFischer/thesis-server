@@ -35,10 +35,10 @@ it writes a briefing, it exits.
 
 ### 1. Fill in your watchlist
 
-Edit `watchlist.md`. The thesis line under each holding is what decides whether
-a story makes the briefing — specific theses produce a signal-dense briefing,
-vague ones produce noise. The "Not interesting" section at the bottom matters
-just as much.
+Edit `watchlist.md`. The "Watching for" line under each holding is what decides
+whether a story makes the briefing — specific lines produce a signal-dense
+briefing, vague ones produce noise. The "Not interesting" section at the bottom
+matters just as much.
 
 ### 2. Try it locally first
 
@@ -136,6 +136,12 @@ different failure.
 Fastest loop, and the only one that matters for output quality. Uses your
 existing interactive Claude Code login, so no token needed.
 
+Once, to install `marked` for the HTML email step:
+
+```bash
+npm ci
+```
+
 ```bash
 set -a; . ./.env; set +a
 ```
@@ -146,7 +152,8 @@ set -a; . ./.env; set +a
 
 With `RESEND_API_KEY` empty it writes `archive/<date>.md` and stops. Read it,
 edit `watchlist.md` and `prompt.md`, delete the file, run again. Expect several
-rounds — the thesis lines and the "Not interesting" list do most of the work.
+rounds — the "Watching for" lines and the "Not interesting" list do most of the
+work.
 
 To iterate without waiting for a full research run, cap it:
 
@@ -198,6 +205,19 @@ curl -fsS https://api.resend.com/emails -H "Authorization: Bearer $RESEND_API_KE
 ```
 
 Most failures here are Resend domain verification, not the script.
+
+To check how the mail will actually look, render a past briefing on its own and
+open the result in a browser:
+
+```bash
+node to_html.mjs archive/2026-08-06.md > /tmp/preview.html
+```
+
+`run.sh` sends that HTML as the message body with the raw markdown as the
+plain-text alternative. Gmail displays `text` verbatim, so without the HTML the
+briefing arrives full of literal `##` and `[label](url)`. If the render fails,
+the run logs a warning and falls back to text — an ugly briefing beats a missing
+one.
 
 ### Testing the deploy itself
 
@@ -256,7 +276,7 @@ week (`BRIEFING_CRON=30 5 * * 1,3,5`). If it's still tight, the ladder is Max,
 or API billing with `ANTHROPIC_API_KEY` — around $22/month on `sonnet` with
 these caps.
 
-**The briefing is padded or repetitive.** Tighten the thesis lines in
+**The briefing is padded or repetitive.** Tighten the "Watching for" lines in
 `watchlist.md` and extend the "Not interesting" list. That fixes it far more
 reliably than editing `prompt.md`.
 

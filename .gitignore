@@ -1,4 +1,5 @@
 .env
+node_modules/
 archive/*.md
 logs/*
 !archive/.gitkeep
