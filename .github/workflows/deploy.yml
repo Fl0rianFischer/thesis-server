@@ -146,19 +146,60 @@ jobs:
 
             # One-time migration into the per-agent layout. data/archive is the
             # morning briefing's memory — each run reads its last few briefs so
-            # it doesn't repeat itself — so leaving it behind would not fail
-            # anything, it would just make every morning start cold. Guarded on
-            # the old path existing, so this is a no-op on every later deploy.
-            if [ -d data/archive ] && [ ! -d data/morning-briefing/archive ]; then
-              echo "migrating data/archive -> data/morning-briefing/archive"
-              mkdir -p data/morning-briefing
-              mv data/archive data/morning-briefing/archive
-            fi
-            if [ -d data/logs ] && [ ! -d data/morning-briefing/logs ]; then
-              echo "migrating data/logs -> data/morning-briefing/logs"
-              mkdir -p data/morning-briefing
-              mv data/logs data/morning-briefing/logs
-            fi
+            # it doesn't repeat itself — so losing it would not fail anything, it
+            # would just make every morning start cold.
+            #
+            # A plain `mv data/archive ...` does NOT work here, and the reason is
+            # not obvious: renaming a *directory* into a new parent needs write
+            # permission on the directory being moved, because the kernel has to
+            # update its ".." entry. data/archive is owned by the container's uid
+            # 1000, not by the deploy user, so both parents being writable is not
+            # enough and mv fails with EACCES. (Moving a plain file has no such
+            # requirement, which is why the cron.log move below has always been
+            # fine.) Hence the ladder: rename, rename as root, else copy — copy
+            # needs only read on the source, and leaves the original untouched.
+            #
+            # This never aborts the deploy. A failure here costs one agent its
+            # history; aborting costs BOTH agents their cron entries, because the
+            # code is already pulled and the old crontab line no longer matches
+            # the new tick.sh. Warn loudly and keep going.
+            #
+            # Guarded on the destination being *empty* rather than absent, so a
+            # partial or failed migration is retried on the next deploy instead
+            # of being silently skipped forever.
+            migrate_dir() {
+              src="$1"; dst="$2"
+              if [ ! -d "$src" ]; then return 0; fi
+              if [ -n "$(ls -A "$dst" 2>/dev/null)" ]; then return 0; fi
+
+              mkdir -p "$(dirname "$dst")"
+
+              if [ ! -e "$dst" ] && mv "$src" "$dst" 2>/dev/null; then
+                echo "migrated $src -> $dst"
+                return 0
+              fi
+              if [ ! -e "$dst" ] && sudo -n mv "$src" "$dst" 2>/dev/null; then
+                echo "migrated $src -> $dst (as root)"
+                return 0
+              fi
+
+              mkdir -p "$dst"
+              if cp -a "$src/." "$dst/" 2>/dev/null \
+                 || sudo -n cp -a "$src/." "$dst/" 2>/dev/null; then
+                echo "migrated $src -> $dst by copy"
+                echo "  $src is still there as a backup — delete it once a brief has run"
+                return 0
+              fi
+
+              echo "::warning::could not migrate $src to $dst — that agent starts with no history"
+              echo "WARNING: could not migrate $src to $dst. Deploy continued anyway."
+              echo "WARNING: the agent will run, but with no memory of past briefs. Fix by hand:"
+              echo "WARNING:   sudo mv /opt/briefing/$src /opt/briefing/$dst"
+              return 0
+            }
+
+            migrate_dir data/archive data/morning-briefing/archive
+            migrate_dir data/logs    data/morning-briefing/logs
 
             mkdir -p data/morning-briefing/archive data/morning-briefing/logs \
                      data/opportunities/archive data/opportunities/logs \
@@ -255,6 +296,17 @@ jobs:
                   }
               fi
             done
+
+            # The migration above is the one step that can degrade something
+            # silently, so report what each agent actually has to read. A
+            # morning-briefing archive that says 0 briefs on a box that has been
+            # running for weeks means the migration did not take.
+            for a in morning-briefing opportunities; do
+              echo "$a: $(ls -1 "data/$a/archive"/*.md 2>/dev/null | wc -l | tr -d ' ') past briefs"
+            done
+            if [ -d data/archive ]; then
+              echo "note: the pre-migration data/archive is still on disk as a backup"
+            fi
 
             echo "next morning-briefing: $(./tick.sh morning-briefing --dry-run | tail -1)"
             echo "next opportunities:    $(./tick.sh opportunities --dry-run | tail -1)"

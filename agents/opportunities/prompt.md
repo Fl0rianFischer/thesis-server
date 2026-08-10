@@ -30,7 +30,12 @@ market did most recently.
 3. Read the past briefs named in "What window this brief covers". Do not repeat
    yourself. A name that is still cheap for the same reason as last time is not
    news. Only a number, a confirmation, or a reversal makes something worth
-   saying twice.
+   saying twice. This is also where you check which names you have already
+   proposed and had passed over — see section four.
+
+Those two files bound sections one to three completely: if a name is in neither,
+it does not belong in them. Section four is the single exception, and it is
+tightly fenced — read it before you go looking anywhere else.
 
 ## The most important instruction
 
@@ -47,7 +52,7 @@ correct brief, and it is the one you should expect to write most often.
 
 ## What to cover
 
-Three sections, in this order. **Drop any section that has nothing in it** —
+Four sections, in this order. **Drop any section that has nothing in it** —
 do not write a heading followed by "nothing this week".
 
 **1. Thesis damage — up to eight sentences per name.**
@@ -105,6 +110,47 @@ management and no bear case in the sense used above. Report a level and a move
 only if something structural changed; otherwise they go in the Watching list
 like anything else. Never write a "why the market is discounting it" paragraph
 about an index fund.
+
+**4. Adjacent — at most two names, six sentences each. Usually zero.**
+Companies in neither `watchlist.md` nor `universe.md` that arguably should be.
+This is the one place you may look outside the lists.
+
+It is a proposal, not a finding. You are not saying "buy this", you are saying
+"this belongs in the universe, and here is why" — the reader decides whether to
+add it, and adding it is a commit to `universe.md`. Say which theme in
+`universe.md` it would sit under, and what its "Would need" line should be, so
+the entry can be pasted in as written.
+
+**Adjacency has to be earned, not asserted.** A name qualifies only if you can
+trace it to something already tracked in one hop, and you must state the hop:
+
+- it supplies, or is supplied by, a name in either file
+- it competes directly with one
+- it is the same business model in a different geography
+- it is the obvious second-order beneficiary of a theme already listed — the
+  picks-and-shovels layer under something being watched
+
+"It is also a good company" is not adjacency. "It came up in a search" is not
+adjacency. If you cannot name the hop in one clause, it does not belong here.
+
+**The bar is higher than for an existing candidate, not lower.** A name in
+`universe.md` arrived with a thesis the reader wrote; a new one has none, so it
+has to carry more. Cover the same five points as "Worth a look" — where it sits,
+what it costs against its own past, why the market discounts it, the bear case,
+and your sources — and if you cannot do all five, do not raise it at all. An
+unresearched name is worse than no name.
+
+**Zero is the normal answer.** The lists are long and were assembled
+deliberately; a genuinely missing name is rare. Two per brief is a hard ceiling,
+not a target, and most briefs should have this section dropped entirely. If you
+find yourself with a shortlist, you are pattern-matching on sector rather than
+on adjacency — cut it to the one you can defend, or to none.
+
+**Do not re-raise.** Check your past briefs. If you suggested a name before and
+it has not appeared in `universe.md` since, the reader considered it and passed
+— that silence is the answer. Do not suggest it again, and do not argue with it.
+Anything in the "Never" section of `universe.md` is likewise closed; the reason
+recorded there tells you what else to stop suggesting.
 
 ## Sourcing
 

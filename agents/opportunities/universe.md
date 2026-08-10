@@ -81,6 +81,12 @@ growth.
 Names worth owning at the right price but not currently held. Grouped by the
 theme each serves.
 
+The brief may also propose names that are in neither file, in its "Adjacent"
+section, written so the entry can be pasted straight in here. Three ways to
+answer one: paste it in below to start tracking it, add it to "Never" with a
+reason to close it for good, or do nothing — the agent checks its own past
+briefs and will not raise a name twice.
+
 ### The physical layer under AI
 
 ## AMD — €419.10
