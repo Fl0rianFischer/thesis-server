@@ -2,24 +2,41 @@
 # Image built in CI, pulled from GHCR by tag (IMAGE_TAG in .env, written by the
 # deploy job).
 #
-# There is no long-running service here. The briefing is an ephemeral container
-# fired once a day by host cron:
+# One service serves both agents. They are the same runtime and differ only in
+# the argument, which arrives as the Compose command:
 #
-#   docker compose --profile cron run --rm briefing
+#   docker compose --profile cron run --rm agent morning-briefing
+#   docker compose --profile cron run --rm agent opportunities
 #
-# `profiles: [cron]` keeps a stray `docker compose up -d` from firing a briefing
+# There is no long-running service here. Each brief is an ephemeral container
+# fired by host cron via tick.sh — no cron daemon in the image, no supervisor,
+# nothing to keep alive, and the thing cron runs is exactly the thing you can
+# run by hand.
+#
+# `profiles: [cron]` keeps a stray `docker compose up -d` from firing a brief
 # (and emailing you) as a side effect of poking at the box.
 
 services:
-  briefing:
+  agent:
     image: ghcr.io/fl0rianfischer/morning-briefing:${IMAGE_TAG:-latest}
     profiles: [cron]
     env_file: [.env]
     volumes:
-      # State the agent carries between runs. archive/ is the memory: each run
-      # reads the last few briefings so it doesn't repeat itself. Losing this
-      # volume means every morning starts cold.
-      - ./data/archive:/app/archive
-      - ./data/logs:/app/logs
+      # One mount rather than one per agent, because one service cannot vary
+      # its mounts by argument. Inside it, each agent owns its own subtree:
+      #
+      #   data/<agent>/archive   the memory — each run reads its own last few
+      #                          briefs so it doesn't repeat itself. Separate
+      #                          per agent on purpose: shared, the morning
+      #                          briefing would read long-horizon research as
+      #                          its own prior reporting and vice versa.
+      #   data/<agent>/logs      per-agent cost and turn accounting
+      #   data/state             attempts and locks — written by tick.sh on the
+      #                          HOST, not in here
+      #   data/cron.log          written by cron's redirect on the host
+      #
+      # The last two matter for ownership: only the per-agent trees may be
+      # chowned to the container's uid. See the chown loop in deploy.yml.
+      - ./data:/app/data
     restart: 'no'
     stop_grace_period: 30s

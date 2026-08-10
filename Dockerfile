@@ -54,16 +54,20 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev \
   && npm cache clean --force
 
-# Config lives in the image, so changing the watchlist is a deploy — versioned,
-# reviewable, and rolled back the same way as anything else. State (archive/,
-# logs/) is mounted in at runtime; see docker-compose.yml.
-COPY prompt.md watchlist.md ./
-COPY to_html.mjs ./to_html.mjs
-COPY context.mjs ./context.mjs
-COPY run.sh ./run.sh
+# Config lives in the image, so changing a watchlist or a prompt is a deploy —
+# versioned, reviewable, and rolled back the same way as anything else. State
+# (data/) is mounted in at runtime; see docker-compose.yml.
+#
+# Both agents ship in one image. They are the same runtime and differ only in
+# the argument they are invoked with, so a second image would double CI time
+# and pull bandwidth for no isolation gain — the isolation that matters is
+# filesystem, schedule and failure state, and that lives outside the image.
+COPY watchlist.md ./watchlist.md
+COPY lib ./lib
+COPY agents ./agents
 
-RUN chmod +x /app/run.sh \
-  && mkdir -p /app/archive /app/logs \
+RUN chmod +x /app/lib/run.sh \
+  && mkdir -p /app/data \
   && chown -R 1000:1000 /app /home/briefing
 
 # Numeric rather than `USER briefing`: this is what the mount-ownership check in
@@ -71,4 +75,6 @@ RUN chmod +x /app/run.sh \
 # directories, and a name would tell it nothing.
 USER 1000:1000
 
-ENTRYPOINT ["/app/run.sh"]
+# The agent name arrives as the Compose command:
+#   docker compose --profile cron run --rm agent opportunities
+ENTRYPOINT ["/app/lib/run.sh"]

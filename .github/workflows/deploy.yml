@@ -50,6 +50,8 @@ jobs:
           MAIL_FROM: ${{ vars.MAIL_FROM }}
           MAIL_TO: ${{ vars.MAIL_TO }}
           BRIEFING_HOUR: ${{ vars.BRIEFING_HOUR }}
+          OPPS_HOUR: ${{ vars.OPPS_HOUR }}
+          OPPS_ENABLED: ${{ vars.OPPS_ENABLED }}
           CLAUDE_TOKEN_ISSUED: ${{ vars.CLAUDE_TOKEN_ISSUED }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -75,15 +77,31 @@ jobs:
             exit 1
           fi
 
-          if [ -n "$BRIEFING_HOUR" ] && ! { [ "$BRIEFING_HOUR" -ge 0 ] && [ "$BRIEFING_HOUR" -le 23 ]; } 2>/dev/null; then
-            echo "::error::BRIEFING_HOUR='$BRIEFING_HOUR' must be an hour 0-23."
-            exit 1
+          for pair in "BRIEFING_HOUR:$BRIEFING_HOUR" "OPPS_HOUR:$OPPS_HOUR"; do
+            name="${pair%%:*}"; value="${pair#*:}"
+            if [ -n "$value" ] && ! { [ "$value" -ge 0 ] && [ "$value" -le 23 ]; } 2>/dev/null; then
+              echo "::error::$name='$value' must be an hour 0-23."
+              exit 1
+            fi
+          done
+
+          # The two agents share one subscription's usage limits, and tick.sh
+          # makes a run wait rather than overlap. Scheduling them on the same
+          # hour is therefore not broken, just slower — the second one starts on
+          # a later tick. Worth saying out loud rather than discovering later.
+          if [ -n "$OPPS_HOUR" ] && [ "$OPPS_HOUR" = "${BRIEFING_HOUR:-5}" ]; then
+            echo "::warning::OPPS_HOUR and BRIEFING_HOUR are both $OPPS_HOUR — the second agent will wait for the first and start up to 15 minutes late."
           fi
 
           [ -n "$CLAUDE_TOKEN_ISSUED" ] \
             || echo "::warning::CLAUDE_TOKEN_ISSUED is unset — the OAuth token expires after a year with no warning."
 
           echo "configuration OK — TZ=$TZ, briefing at ${BRIEFING_HOUR:-5}:00 local"
+          if [ "${OPPS_ENABLED:-0}" = "1" ]; then
+            echo "opportunities enabled, at ${OPPS_HOUR:-7}:00 local"
+          else
+            echo "opportunities present but disabled (set OPPS_ENABLED=1 to turn it on)"
+          fi
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1
@@ -100,6 +118,14 @@ jobs:
           BRIEFING_HOUR: ${{ vars.BRIEFING_HOUR }}
           BRIEFING_DAYS: ${{ vars.BRIEFING_DAYS }}
           BRIEFING_MAX_ATTEMPTS: ${{ vars.BRIEFING_MAX_ATTEMPTS }}
+          OPPS_ENABLED: ${{ vars.OPPS_ENABLED }}
+          OPPS_MAIL_TO: ${{ vars.OPPS_MAIL_TO }}
+          OPPS_MODEL: ${{ vars.OPPS_MODEL }}
+          OPPS_EFFORT: ${{ vars.OPPS_EFFORT }}
+          OPPS_MAX_TURNS: ${{ vars.OPPS_MAX_TURNS }}
+          OPPS_HOUR: ${{ vars.OPPS_HOUR }}
+          OPPS_DAYS: ${{ vars.OPPS_DAYS }}
+          OPPS_MAX_ATTEMPTS: ${{ vars.OPPS_MAX_ATTEMPTS }}
           # Secrets (masked)
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -107,14 +133,36 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_HOUR,BRIEFING_DAYS,BRIEFING_MAX_ATTEMPTS,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY
+          # A name missing from this list is silently absent on the box — the
+          # same class of bug that once shipped a blank MAIL_FROM: green build,
+          # green deploy, and a brief that never arrived. Adding a variable
+          # above means adding it here and to the heredoc below.
+          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_HOUR,BRIEFING_DAYS,BRIEFING_MAX_ATTEMPTS,OPPS_ENABLED,OPPS_MAIL_TO,OPPS_MODEL,OPPS_EFFORT,OPPS_MAX_TURNS,OPPS_HOUR,OPPS_DAYS,OPPS_MAX_ATTEMPTS,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY
           script: |
             set -e
             cd /opt/briefing
             git pull --ff-only
-            chmod +x tick.sh healthcheck.sh run.sh
+            chmod +x tick.sh healthcheck.sh lib/run.sh
 
-            mkdir -p data/archive data/logs data/state
+            # One-time migration into the per-agent layout. data/archive is the
+            # morning briefing's memory — each run reads its last few briefs so
+            # it doesn't repeat itself — so leaving it behind would not fail
+            # anything, it would just make every morning start cold. Guarded on
+            # the old path existing, so this is a no-op on every later deploy.
+            if [ -d data/archive ] && [ ! -d data/morning-briefing/archive ]; then
+              echo "migrating data/archive -> data/morning-briefing/archive"
+              mkdir -p data/morning-briefing
+              mv data/archive data/morning-briefing/archive
+            fi
+            if [ -d data/logs ] && [ ! -d data/morning-briefing/logs ]; then
+              echo "migrating data/logs -> data/morning-briefing/logs"
+              mkdir -p data/morning-briefing
+              mv data/logs data/morning-briefing/logs
+            fi
+
+            mkdir -p data/morning-briefing/archive data/morning-briefing/logs \
+                     data/opportunities/archive data/opportunities/logs \
+                     data/state
 
             cat > .env <<ENVEOF
             IMAGE_TAG=$IMAGE_TAG
@@ -128,6 +176,14 @@ jobs:
             BRIEFING_HOUR=$BRIEFING_HOUR
             BRIEFING_DAYS=$BRIEFING_DAYS
             BRIEFING_MAX_ATTEMPTS=$BRIEFING_MAX_ATTEMPTS
+            OPPS_ENABLED=$OPPS_ENABLED
+            OPPS_MAIL_TO=$OPPS_MAIL_TO
+            OPPS_MODEL=$OPPS_MODEL
+            OPPS_EFFORT=$OPPS_EFFORT
+            OPPS_MAX_TURNS=$OPPS_MAX_TURNS
+            OPPS_HOUR=$OPPS_HOUR
+            OPPS_DAYS=$OPPS_DAYS
+            OPPS_MAX_ATTEMPTS=$OPPS_MAX_ATTEMPTS
             CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN
             RESEND_API_KEY=$RESEND_API_KEY
             ENVEOF
@@ -145,26 +201,49 @@ jobs:
                 || cp data/logs/cron.log data/cron.log 2>/dev/null || true
             fi
 
-            # The crontab no longer encodes the schedule or a timezone — it
-            # just runs tick.sh, which reads TZ and BRIEFING_HOUR/DAYS from
-            # .env and decides. CRON_TZ is gone: it is a vendor extension this
-            # box's cron ignores, which is why "0 5" was firing at 05:00
-            # Europe/Berlin and landing at 10:00 in Jakarta. The host's
-            # timezone is now irrelevant to this project.
-            CRON_LINE="*/15 * * * * /opt/briefing/tick.sh >> /opt/briefing/data/cron.log 2>&1 # morning-briefing"
-            ( crontab -l 2>/dev/null | grep -v '# morning-briefing$' | grep -v '^CRON_TZ=' || true
-              echo "$CRON_LINE" ) | crontab -
+            # One line per agent. The crontab still encodes no schedule and no
+            # timezone — each line just runs tick.sh for one agent, and tick.sh
+            # reads TZ and that agent's HOUR/DAYS from .env and decides.
+            # CRON_TZ is gone: it is a vendor extension this box's cron
+            # ignores, which is why "0 5" was firing at 05:00 Europe/Berlin and
+            # landing at 10:00 in Jakarta. The host's timezone is irrelevant to
+            # this project.
+            #
+            # Both lines are always installed. A disabled agent is disabled by
+            # OPPS_ENABLED in .env, not by withholding its cron entry — so
+            # turning it on is a variable change rather than a crontab edit,
+            # and `tick.sh opportunities --dry-run` can explain itself either
+            # way.
+            #
+            # The legacy '# morning-briefing' tag is stripped too: the old
+            # single line called tick.sh with no agent argument, which the new
+            # tick.sh rejects.
+            {
+              crontab -l 2>/dev/null \
+                | grep -v '# briefing-agent$' \
+                | grep -v '# morning-briefing$' \
+                | grep -v '^CRON_TZ=' || true
+              echo "*/15 * * * * /opt/briefing/tick.sh morning-briefing >> /opt/briefing/data/cron.log 2>&1 # briefing-agent"
+              echo "*/15 * * * * /opt/briefing/tick.sh opportunities >> /opt/briefing/data/cron.log 2>&1 # briefing-agent"
+            } | crontab -
             echo "cron installed:"
-            crontab -l | grep '# morning-briefing$'
+            crontab -l | grep '# briefing-agent$'
 
             # Bind mounts arrive with the host's ownership regardless of what
             # the image chowned, so a uid mismatch denies every write inside
             # the container — the failure that made the agent look like it was
             # producing nothing. Fix it if we can, name it exactly if we cannot.
+            #
+            # ONLY the per-agent trees. data/ is one mount now, but it also
+            # holds data/state (attempts and locks, written by tick.sh on the
+            # host) and data/cron.log (written by cron's own redirect). A
+            # blanket `chown -R data` would hand those to the container's uid
+            # and break cron's append — the same shape as the bug that had
+            # cron.log living in data/logs.
             IMG_UID="$(docker image inspect --format '{{.Config.User}}' \
                        "ghcr.io/fl0rianfischer/morning-briefing:$IMAGE_TAG" 2>/dev/null | cut -d: -f1)"
             case "$IMG_UID" in ''|*[!0-9]*) IMG_UID=1000 ;; esac
-            for d in data/archive data/logs; do
+            for d in data/morning-briefing data/opportunities; do
               CUR="$(stat -c %u "$d")"
               if [ "$CUR" != "$IMG_UID" ]; then
                 chown -R "$IMG_UID:$IMG_UID" "$d" 2>/dev/null \
@@ -172,9 +251,10 @@ jobs:
                   || {
                     echo "WARNING: $d is owned by uid $CUR but the container runs as $IMG_UID."
                     echo "WARNING: every write inside the container will be denied. Run once:"
-                    echo "WARNING:   sudo chown -R $IMG_UID:$IMG_UID /opt/briefing/data/archive /opt/briefing/data/logs"
+                    echo "WARNING:   sudo chown -R $IMG_UID:$IMG_UID /opt/briefing/data/morning-briefing /opt/briefing/data/opportunities"
                   }
               fi
             done
 
-            echo "next run: $(./tick.sh --dry-run | tail -1)"
+            echo "next morning-briefing: $(./tick.sh morning-briefing --dry-run | tail -1)"
+            echo "next opportunities:    $(./tick.sh opportunities --dry-run | tail -1)"

@@ -3,11 +3,12 @@
 node_modules
 .env
 .env.example
-archive
-logs
-data
 README.md
 docker-compose.yml
+
+# All runtime state for every agent — archives, logs, attempts, locks, cron.log.
+# Bind-mounted in at /app/data rather than baked into the image.
+data
 
 # Host-side scripts: cron runs these on the box, not in the container
 tick.sh

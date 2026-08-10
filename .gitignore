@@ -1,9 +1,7 @@
 .env
 node_modules/
-archive/*.md
-logs/*
-!archive/.gitkeep
-!logs/.gitkeep
 
-# Runtime state on the box (bind-mounted into the container)
+# All runtime state, for every agent: the archives (each agent's memory), the
+# per-run logs, the attempts counters and locks, and cron.log. Bind-mounted
+# into the container on the box; created locally by a bare ./lib/run.sh.
 data/
