@@ -57,6 +57,14 @@ plus_one_year() {
   date -d "$1 +1 year" +%F 2>/dev/null || date -j -v+1y -f "%Y-%m-%d" "$1" +%F 2>/dev/null
 }
 
+# Owning uid of a path — GNU stat on the box, BSD stat on a laptop. Prints
+# nothing if the path does not exist, so callers must treat empty as missing
+# rather than defaulting to a number: a bare `|| echo -1` here silently turned
+# the host-owned checks below into a PASS against a uid that never existed.
+uid_of() {
+  stat -c %u "$1" 2>/dev/null || stat -f %u "$1" 2>/dev/null
+}
+
 # Per-agent config, matching tick.sh. The defaults have to match tick.sh's or
 # this reports a schedule the box is not actually keeping.
 agent_cfg() {
@@ -162,31 +170,43 @@ if docker info >/dev/null 2>&1; then
   if docker image inspect "$RUNNING_IMG" >/dev/null 2>&1; then
     pass "image present: ${RUNNING_IMG##*/}"
     IMG_UID="$(docker image inspect --format '{{.Config.User}}' "$RUNNING_IMG" 2>/dev/null | cut -d: -f1)"
-    if [[ "$IMG_UID" =~ ^[0-9]+$ ]]; then
-      for a in "${AGENTS[@]}"; do
-        d="data/$a"
-        DIR_UID="$(stat -c %u "$d" 2>/dev/null || echo -1)"
-        if [ "$DIR_UID" = "$IMG_UID" ]; then
-          pass "$d owned by uid $DIR_UID, matching the image"
-        else
-          fail "$d is uid $DIR_UID but the container runs as $IMG_UID — writes will be denied"
-          fail "  sudo chown -R $IMG_UID:$IMG_UID $APP_DIR/$d"
-        fi
-      done
-    else
-      warn "image user is '${IMG_UID:-unset}', not numeric — cannot verify mount ownership"
+    if ! [[ "$IMG_UID" =~ ^[0-9]+$ ]]; then
+      warn "image user is '${IMG_UID:-unset}', not numeric — falling back to 1000"
       IMG_UID=""
     fi
   else
     fail "image not present locally: $RUNNING_IMG"
     fail "  the deploy pre-pulls this, so either it has not run since the last"
-    fail "  push, or the pull failed — check GHCR auth (docker login ghcr.io)."
-    fail "  A run would still pull it on demand, at 05:00, which is the wrong"
-    fail "  time to find out the credentials expired."
+    fail "  push, or the pull failed. A transient GHCR rate limit self-heals —"
+    fail "  the next run pulls on demand. An auth failure does not: check with"
+    fail "  docker login ghcr.io, or run 'docker compose --profile cron pull'."
   fi
 else
   fail "docker daemon not responding"
 fi
+
+# Checked even when the image is missing. The Dockerfile pins the uid to 1000,
+# so a missing image is no reason to skip the check — and a deploy that failed
+# before pulling is exactly when other steps may also have been skipped, which
+# makes this the moment you most want it verified rather than silently omitted.
+if [ -z "$IMG_UID" ]; then
+  IMG_UID=1000
+  UID_SOURCE=" (assumed — the Dockerfile pins it)"
+else
+  UID_SOURCE=""
+fi
+for a in "${AGENTS[@]}"; do
+  d="data/$a"
+  DIR_UID="$(stat -c %u "$d" 2>/dev/null || echo -1)"
+  if [ "$DIR_UID" = "-1" ]; then
+    fail "$d does not exist — redeploy to create it"
+  elif [ "$DIR_UID" = "$IMG_UID" ]; then
+    pass "$d owned by uid $DIR_UID, matching the container$UID_SOURCE"
+  else
+    fail "$d is uid $DIR_UID but the container runs as $IMG_UID — writes will be denied"
+    fail "  sudo chown -R $IMG_UID:$IMG_UID $APP_DIR/$d"
+  fi
+done
 
 # The other half of the ownership story, and the one a blanket `chown -R data`
 # would break. data/ is a single mount now, but data/state and data/cron.log

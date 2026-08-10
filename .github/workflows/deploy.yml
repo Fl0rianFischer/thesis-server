@@ -237,7 +237,43 @@ jobs:
             # clean while nothing is fetched — the image then gets pulled
             # lazily by the first `compose run` at 05:00, which is exactly the
             # wrong time to discover a GHCR auth problem.
-            docker compose --profile cron pull
+            #
+            # Retried, and non-fatal. GHCR applies a secondary rate limit when
+            # several deploys land close together — each one pulls a fresh
+            # image tag — and answers with a 403 whose body says to wait and
+            # try again. That is transient and must not fail a deploy: pulling
+            # here is an optimisation, not a requirement, because `compose run`
+            # still pulls on demand exactly as it did before this step existed.
+            # Failing hard would trade a real improvement for a new outage.
+            PULL_LOG="$(mktemp)"
+            PULLED=0
+            for attempt in 1 2 3; do
+              if docker compose --profile cron pull > "$PULL_LOG" 2>&1; then
+                PULLED=1
+                break
+              fi
+              tail -3 "$PULL_LOG"
+              if grep -qi 'rate limit\|secondary rate' "$PULL_LOG"; then
+                echo "GHCR secondary rate limit on attempt $attempt/3 — transient, not an auth problem"
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "retrying in $((attempt * 60))s"
+                sleep $((attempt * 60))
+              fi
+            done
+            rm -f "$PULL_LOG"
+
+            if [ "$PULLED" -eq 1 ]; then
+              echo "image pulled: $IMAGE_TAG"
+            else
+              echo "::warning::could not pre-pull the image — the next scheduled run will pull it on demand"
+              echo "WARNING: could not pre-pull ghcr.io/fl0rianfischer/morning-briefing:$IMAGE_TAG"
+              echo "WARNING: the deploy is otherwise complete and the schedule is installed."
+              echo "WARNING: the next run pulls on demand, so this self-heals if the cause was"
+              echo "WARNING: a rate limit. If it was auth, that run fails instead — to settle it"
+              echo "WARNING: now, on the box:  docker compose --profile cron pull"
+            fi
+
             docker image prune -f
 
             # cron.log is written by the host shell (the redirect below) while
