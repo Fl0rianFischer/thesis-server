@@ -4,20 +4,26 @@ wants to know what changed while they were asleep.
 
 ## When this is read
 
-The reader is in Jakarta (UTC+7) and reads this at 5am local, over coffee.
+The reader has this with their morning coffee, shortly after it is written.
 
-That timing matters for what you write. Jakarta is 11 hours ahead of US Eastern
-in summer, 12 in winter, and the holdings are US-listed. So at 5am Jakarta:
+The **"Right now"** section at the end of these instructions gives the reader's
+timezone, the current local date and time, when the US session last closed and
+when it next opens — all expressed in the reader's own zone. Those values are
+computed fresh on every run. Work from them. Do not assume a city, an offset,
+or a fixed distance from US Eastern; the reader moves, and stale assumptions
+about their clock are invisible in the finished briefing.
 
-- The US session **closed about two hours ago** (4pm ET is 3am Jakarta). This is
-  a wrap of the session that just ended, not a preview of one about to open.
-- Companies that reported **after the close did so one to two hours ago**. Those
-  results are the freshest and most valuable thing you can lead with.
-- After-hours trading is still running as you write. Where a stock moved on
-  after-hours news, say so and label it as after-hours.
-- "Today" for the reader means the US session that opens at 9:30pm Jakarta this
-  evening. Say "tonight" for that session and give Jakarta times for anything
-  the reader might want to be awake for.
+What follows from those values:
+
+- You are writing a **wrap of the session that has already closed**, not a
+  preview of one about to open. If the close was some hours ago, say so.
+- Companies that reported **after that close** are the freshest and most
+  valuable thing you have. Lead with them.
+- If the close was recent enough that after-hours trading is still running as
+  you write, say so, and label after-hours moves as after-hours.
+- For the session that opens next, use the phrase "Right now" gives you —
+  "tonight", "this afternoon", "tomorrow morning" — rather than "today", and
+  give local times for anything the reader might want to be awake for.
 
 ## Before you write
 
@@ -28,9 +34,9 @@ in summer, 12 in winter, and the holdings are US-listed. So at 5am Jakarta:
    already reported. A story you covered yesterday is only worth mentioning
    again if there is a genuine development — a number, a confirmation, a
    reversal. "Still ongoing" is not a development.
-3. Today's date is the date of the file you are about to write. Anything older
-   than about 36 hours is not news unless it is the first time you are
-   reporting it.
+3. Today's date, and the exact filename to write, are given in "Right now".
+   Anything older than about 36 hours is not news unless it is the first time
+   you are reporting it.
 
 ## Length
 
@@ -49,8 +55,8 @@ genuinely nothing in it — an empty section is better than filler.
 **1. Macro — one paragraph, six sentences maximum.**
 How the session that just closed went, in one pass: index direction on the
 close, rates, and the single most important thing repricing risk. Close with a
-bare list of what is scheduled before and during tonight's session, in Jakarta
-time. Do not give each topic its own paragraph.
+bare list of what is scheduled before and during the next session, in the
+reader's local time. Do not give each topic its own paragraph.
 
 **2. Holdings — five to six sentences per holding.**
 **Every holding with real news gets its own block, headed by its ticker.** There
@@ -100,9 +106,11 @@ it matters to the holding. The reader decides what to do about it.
 
 ## Output
 
-Write the finished briefing to `archive/<YYYY-MM-DD>.md` using today's date.
-Start the file with a `# Briefing — <date>` heading. Write nothing else to
-disk, and do not modify `watchlist.md` or any existing file in `archive/`.
+Write the finished briefing to the exact path named in "Right now" — that
+filename is also how the scheduler knows the day is done, so writing it
+anywhere else means the run is treated as failed and retried. Start the file
+with a `# Briefing — <date>` heading. Write nothing else to disk, and do not
+modify `watchlist.md` or any existing file in `archive/`.
 
 Your final chat message should be one line confirming the file you wrote. The
 briefing itself lives in the file — do not also print it.

@@ -15,15 +15,29 @@ long-lived OAuth token.
 ```
 push to main  →  GitHub Actions  →  GHCR image  →  ssh deploy  →  /opt/briefing
 
-host cron (05:00 WIB)  →  docker compose run --rm briefing
-                         →  claude -p
-                         →  data/archive/YYYY-MM-DD.md
-                         →  Resend  →  inbox
+host cron (every 15 min)  →  tick.sh  →  is it BRIEFING_HOUR in $TZ yet?
+                                      →  is today's briefing already written?
+                                         │
+                                         ↓ no
+                             docker compose run --rm briefing
+                                      →  claude -p
+                                      →  data/archive/YYYY-MM-DD.md
+                                      →  Resend  →  inbox
 ```
+
+**`TZ` is the only timezone in the project.** It sets when the briefing runs,
+what date the file is named for, the mail subject, and how the agent describes
+the market day. The host's own timezone is never consulted. Moving country is
+one variable and a redeploy.
 
 `prompt.md` is the system prompt. `watchlist.md` is what it filters news
 against. Both are baked into the image, so changing your holdings is a commit
 and a deploy — versioned and revertible like anything else.
+
+`context.mjs` computes the time framing — local time, when the US session last
+closed and next opens in the reader's zone, what to call the next session — and
+`run.sh` appends it to `prompt.md` at run time. The prompt therefore contains
+no timezone of its own.
 
 `data/archive/` on the box is the memory: past briefings the agent reads before
 writing a new one. It's a bind-mounted volume, so it survives redeploys. Losing
@@ -93,16 +107,23 @@ To rotate: re-run `claude setup-token`, update the secret, bump
 
 **Variables:**
 
-| Variable | Example |
-|---|---|
-| `TZ` | `Asia/Jakarta` |
-| `CLAUDE_TOKEN_ISSUED` | `2026-08-06` (date you ran `claude setup-token`) |
-| `MAIL_FROM` | `briefing@yourdomain.example` |
-| `MAIL_TO` | `you@example.com` |
-| `BRIEFING_MODEL` | `sonnet` |
-| `BRIEFING_EFFORT` | `medium` |
-| `BRIEFING_MAX_TURNS` | `40` |
-| `BRIEFING_CRON` | `0 5 * * 1-5` (5am Jakarta, weekdays) |
+| Variable | Example | |
+|---|---|---|
+| `TZ` | `Asia/Jakarta` | **required** |
+| `MAIL_FROM` | `briefing@yourdomain.example` | **required** |
+| `MAIL_TO` | `you@example.com` | **required** |
+| `CLAUDE_TOKEN_ISSUED` | `2026-08-06` (date you ran `claude setup-token`) | |
+| `BRIEFING_MODEL` | `sonnet` | |
+| `BRIEFING_EFFORT` | `medium` | |
+| `BRIEFING_MAX_TURNS` | `40` | |
+| `BRIEFING_HOUR` | `5` — hour in `TZ`, not in cron syntax | |
+| `BRIEFING_DAYS` | `1-5` — Monday is 1 | |
+| `BRIEFING_MAX_ATTEMPTS` | `3` retries before giving up for the day | |
+
+The deploy fails if any **required** value is empty, and if `TZ` is not a real
+tz database name. Secrets and Variables are separate tabs on the same GitHub
+settings page — filling in one and not the other is the easiest way to get a
+green deploy that never delivers a briefing.
 
 ### 5. Prepare the box, once
 
@@ -110,32 +131,46 @@ To rotate: re-run `claude setup-token`, update the secret, bump
 sudo git clone https://github.com/fl0rianfischer/morning-briefing.git /opt/briefing
 ```
 
-The checkout only supplies `docker-compose.yml` — everything else ships in the
-image. Confirm Docker can pull from GHCR (`docker login ghcr.io` with a PAT
-carrying `read:packages`, if the package is private).
+The checkout supplies `docker-compose.yml`, `tick.sh` and `healthcheck.sh` —
+everything else ships in the image. Confirm Docker can pull from GHCR
+(`docker login ghcr.io` with a PAT carrying `read:packages`, if the package is
+private).
 
-Set the box timezone to match the schedule:
+**Do not set the box timezone.** It is not consulted. A box in Berlin serving a
+reader in Jakarta is fine, and staying that way is the point — `CRON_TZ` is a
+vendor extension many cron builds ignore silently, so the schedule is decided
+by `tick.sh` reading `TZ` instead of by cron.
+
+The container runs as **uid 1000**, and bind mounts arrive with the host's
+ownership regardless of what the image chowned. If the deploy cannot fix the
+ownership itself it prints the exact command; run it once:
 
 ```bash
-sudo timedatectl set-timezone Asia/Jakarta
+sudo chown -R 1000:1000 /opt/briefing/data/archive /opt/briefing/data/logs
 ```
 
-The deploy writes `CRON_TZ` into the crontab, which should make the schedule
-correct regardless — but not every cron build honours it, and the failure is
-silent (the briefing simply arrives seven hours late). The deploy logs a warning
-if the host clock disagrees.
+Skipping this produces the most confusing failure in this system: `claude`
+never starts, stdout is empty, and the run looks like the model returned
+nothing. `run.sh` now checks for it up front and says so by name.
 
 ### 6. Push to main
 
 The workflow builds the image, writes `/opt/briefing/.env`, pulls, and installs
-the cron entry. The schedule comes from `BRIEFING_CRON` and is reinstalled on
-every deploy, so it can't drift on the box.
+the cron entry. That entry is now a fixed `*/15 * * * * /opt/briefing/tick.sh`
+— it carries no schedule and no timezone, so there is nothing on the box left
+to drift. The schedule lives in `TZ`, `BRIEFING_HOUR` and `BRIEFING_DAYS`.
 
-Trigger a run by hand to check the whole path end to end — this one does send
-the email:
+Ask `tick.sh` what it intends to do, without doing it:
 
 ```bash
-cd /opt/briefing && docker compose --profile cron run --rm briefing
+/opt/briefing/tick.sh --dry-run
+```
+
+Then trigger a run by hand to check the whole path end to end — this one does
+send the email:
+
+```bash
+cd /opt/briefing && ./tick.sh --force
 ```
 
 ## Testing locally
@@ -166,6 +201,13 @@ With `RESEND_API_KEY` empty it writes `archive/<date>.md` and stops. Read it,
 edit `watchlist.md` and `prompt.md`, delete the file, run again. Expect several
 rounds — the "Watching for" lines and the "Not interesting" list do most of the
 work.
+
+To see the time framing the agent will be given — and to check how the briefing
+reframes itself for another timezone before you actually move:
+
+```bash
+TZ=Europe/Berlin node context.mjs
+```
 
 To iterate without waiting for a full research run, cap it:
 
@@ -237,11 +279,16 @@ The workflow only runs on push to `main`, so use a scratch branch and
 `workflow_dispatch` from the Actions tab to trigger it without merging.
 
 The one thing you can't rehearse locally is cron on the box. After the first
-deploy, confirm the entry landed:
+deploy, confirm the entry landed and that the gate agrees with you about when
+it will next fire:
 
 ```bash
-crontab -l | grep morning-briefing
+crontab -l | grep morning-briefing && /opt/briefing/tick.sh --dry-run
 ```
+
+`--dry-run` prints the timezone it is using, the current local time, the
+schedule it read, and its decision — which is the fastest way to tell a
+scheduling problem from a run problem.
 
 ## Design notes
 
@@ -259,12 +306,38 @@ servers in the working directory and `~/.claude` — keep the box clean.
 **Failure is detected by the artifact, not the exit code.** Claude Code reports
 in-run failures, including expired auth, as the result on stdout. `run.sh`
 checks that `archive/<date>.md` exists and is non-empty; that's the real signal.
+`tick.sh` uses the same file as its idempotency key — if today's briefing
+exists, today is done — so there is no separate "have I run yet" state that can
+drift out of sync with reality.
 
-**Ephemeral container, not a scheduled service.** Host cron runs
+**One timezone, and cron is not told about it.** `CRON_TZ` is a vendor
+extension; this box's cron ignores it silently, which meant `0 5` was firing at
+05:00 in the host's zone and landing mid-morning for the reader. So cron now
+runs `tick.sh` on a fixed 15-minute interval and carries no schedule at all,
+and `tick.sh` decides using `TZ` from `.env`. The host's timezone became
+irrelevant rather than merely correct, which is the difference between a fix
+and a thing that has to be remembered. DST is handled by the tz database, so a
+zone that observes it doesn't drift twice a year.
+
+The tick costs one bash process every 15 minutes — the container only starts
+when it's genuinely time. `flock` keeps a slow run from having a second one
+started on top of it, and `BRIEFING_MAX_ATTEMPTS` stops a broken run from
+retrying all day and emptying a month of usage limits in one morning.
+
+**The container's uid is pinned to 1000.** Bind mounts arrive with the host's
+ownership no matter what the image chowned, so the uid inside has to match the
+host directories. `useradd -r` picks an arbitrary system uid — it picked 999 —
+and every write inside the container was denied, which surfaces as `claude`
+producing nothing at all rather than as a permissions error. `run.sh` checks
+writability before it starts, `healthcheck.sh` compares the directory owner to
+the image's `User`, and the deploy fixes or names the mismatch.
+
+**Ephemeral container, not a scheduled service.** `tick.sh` runs
 `docker compose run --rm`. No cron daemon in the image, no supervisor, nothing
 to keep alive — and the thing cron runs is exactly the thing you can run by
-hand. `profiles: [cron]` keeps a stray `docker compose up -d` from firing a
-briefing as a side effect of poking at the box.
+hand with `./tick.sh --force`. `profiles: [cron]` keeps a stray
+`docker compose up -d` from firing a briefing as a side effect of poking at the
+box.
 
 **Compose supplies the environment.** The classic cron failure — empty `PATH`,
 missing tokens — doesn't apply, because `env_file: [.env]` is read by Compose
@@ -273,9 +346,31 @@ to `docker`.
 
 ## Troubleshooting
 
-**Nothing arrives.** Check `data/logs/cron.log`, then `data/logs/<date>.json`
-for the run itself. On failure `run.sh` logs a `FAILED` line plus the first 500
-characters of Claude's result, which is usually the whole answer.
+**Nothing arrives.** Run `./healthcheck.sh` first — it covers everything below
+in one pass and tells you which layer broke. Then `data/cron.log` for the
+scheduling side and `data/logs/<date>.json` for the run itself. On failure
+`run.sh` logs a `FAILED` line plus the first 500 characters of Claude's result.
+
+Note that `grep FAILED` alone can hide the answer: Claude's stderr is written
+above that line, not after it. Read the surrounding context, not just the match.
+
+**It runs but nothing is produced, in zero seconds.** The bind mounts are owned
+by the wrong uid, so the shell cannot even create the log file and `claude`
+never starts. `run.sh` catches this up front now; if you see it, run the
+`chown` from step 5 above. This failure reads exactly like a model failure and
+is not one.
+
+**It never fires at all.** `./tick.sh --dry-run` says which gate stopped it —
+wrong day, hour not reached, briefing already written, or attempts exhausted.
+If it says it *would* run, the problem is downstream of the schedule.
+
+**It fires at the wrong hour.** Check `TZ` in `.env`, not the box. The host
+timezone has no effect; a Berlin box serving a Jakarta reader is correct by
+design.
+
+**It gave up for the day.** After `BRIEFING_MAX_ATTEMPTS` failures `tick.sh`
+stops retrying so a broken run can't burn your usage limits until midnight.
+Fix the cause, then `./tick.sh --force`.
 
 **It stops working after weeks of running.** The OAuth token expired. Re-run
 `claude setup-token`, update the `CLAUDE_CODE_OAUTH_TOKEN` secret, and redeploy
@@ -284,7 +379,7 @@ characters of Claude's result, which is usually the whole answer.
 **It's eating your usage limits.** A 30–40 turn research run is a real chunk of
 a Pro budget and competes with your own Claude Code usage. Lower
 `BRIEFING_MAX_TURNS`, drop `BRIEFING_EFFORT` to `low`, or run three mornings a
-week (`BRIEFING_CRON=0 5 * * 1,3,5`). If it's still tight, the ladder is Max,
+week (`BRIEFING_DAYS=1,3,5`). If it's still tight, the ladder is Max,
 or API billing with `ANTHROPIC_API_KEY` — around $22/month on `sonnet` with
 these caps.
 

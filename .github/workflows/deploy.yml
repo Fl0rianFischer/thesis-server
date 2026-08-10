@@ -39,6 +39,52 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
+      # The .env heredoc below writes every value unconditionally, so an unset
+      # variable becomes an empty line rather than an error. That is how the
+      # first working deploy shipped with MAIL_FROM blank: green build, green
+      # deploy, and a briefing that was written every morning and never sent.
+      # Fail here instead, where it is visible.
+      - name: Check required configuration
+        env:
+          TZ: ${{ vars.TZ }}
+          MAIL_FROM: ${{ vars.MAIL_FROM }}
+          MAIL_TO: ${{ vars.MAIL_TO }}
+          BRIEFING_HOUR: ${{ vars.BRIEFING_HOUR }}
+          CLAUDE_TOKEN_ISSUED: ${{ vars.CLAUDE_TOKEN_ISSUED }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        run: |
+          missing=()
+          [ -n "$TZ" ]                      || missing+=("TZ (variable)")
+          [ -n "$MAIL_FROM" ]               || missing+=("MAIL_FROM (variable)")
+          [ -n "$MAIL_TO" ]                 || missing+=("MAIL_TO (variable)")
+          [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || missing+=("CLAUDE_CODE_OAUTH_TOKEN (secret)")
+          [ -n "$RESEND_API_KEY" ]          || missing+=("RESEND_API_KEY (secret)")
+
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Required configuration is empty. Settings -> Secrets and variables -> Actions."
+            printf '  missing: %s\n' "${missing[@]}"
+            echo "  Note that Secrets and Variables are separate tabs on that page."
+            exit 1
+          fi
+
+          # A typo like Asia/Jakata is not an error anywhere downstream — it
+          # just silently means UTC, and the briefing quietly shifts by hours.
+          if [ ! -f "/usr/share/zoneinfo/$TZ" ]; then
+            echo "::error::TZ='$TZ' is not a zone in the tz database (try Asia/Jakarta, Europe/Berlin)."
+            exit 1
+          fi
+
+          if [ -n "$BRIEFING_HOUR" ] && ! { [ "$BRIEFING_HOUR" -ge 0 ] && [ "$BRIEFING_HOUR" -le 23 ]; } 2>/dev/null; then
+            echo "::error::BRIEFING_HOUR='$BRIEFING_HOUR' must be an hour 0-23."
+            exit 1
+          fi
+
+          [ -n "$CLAUDE_TOKEN_ISSUED" ] \
+            || echo "::warning::CLAUDE_TOKEN_ISSUED is unset — the OAuth token expires after a year with no warning."
+
+          echo "configuration OK — TZ=$TZ, briefing at ${BRIEFING_HOUR:-5}:00 local"
+
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1
         env:
@@ -51,7 +97,9 @@ jobs:
           BRIEFING_MODEL: ${{ vars.BRIEFING_MODEL }}
           BRIEFING_EFFORT: ${{ vars.BRIEFING_EFFORT }}
           BRIEFING_MAX_TURNS: ${{ vars.BRIEFING_MAX_TURNS }}
-          BRIEFING_CRON: ${{ vars.BRIEFING_CRON }}
+          BRIEFING_HOUR: ${{ vars.BRIEFING_HOUR }}
+          BRIEFING_DAYS: ${{ vars.BRIEFING_DAYS }}
+          BRIEFING_MAX_ATTEMPTS: ${{ vars.BRIEFING_MAX_ATTEMPTS }}
           # Secrets (masked)
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
@@ -59,13 +107,14 @@ jobs:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_CRON,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY
+          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_HOUR,BRIEFING_DAYS,BRIEFING_MAX_ATTEMPTS,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY
           script: |
             set -e
             cd /opt/briefing
             git pull --ff-only
+            chmod +x tick.sh healthcheck.sh run.sh
 
-            mkdir -p data/archive data/logs
+            mkdir -p data/archive data/logs data/state
 
             cat > .env <<ENVEOF
             IMAGE_TAG=$IMAGE_TAG
@@ -76,6 +125,9 @@ jobs:
             BRIEFING_MODEL=$BRIEFING_MODEL
             BRIEFING_EFFORT=$BRIEFING_EFFORT
             BRIEFING_MAX_TURNS=$BRIEFING_MAX_TURNS
+            BRIEFING_HOUR=$BRIEFING_HOUR
+            BRIEFING_DAYS=$BRIEFING_DAYS
+            BRIEFING_MAX_ATTEMPTS=$BRIEFING_MAX_ATTEMPTS
             CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN
             RESEND_API_KEY=$RESEND_API_KEY
             ENVEOF
@@ -84,28 +136,45 @@ jobs:
             docker compose pull
             docker image prune -f
 
-            # Reinstall the cron entry on every deploy so the schedule is
-            # config, not something that drifts on the box. Tagged with a
-            # marker comment so replacing it is idempotent.
-            #
-            # CRON_TZ makes the schedule explicit: without it cron uses the
-            # host timezone, and TZ in .env only affects `date` *inside* the
-            # container. A UTC box would fire "0 5" at noon Jakarta with
-            # nothing anywhere to explain it. CRON_TZ takes no trailing
-            # comment — cron reads the rest of the line as the value — so it
-            # is matched by prefix instead.
-            CRON_LINE="${BRIEFING_CRON:-0 5 * * 1-5} cd /opt/briefing && /usr/bin/docker compose --profile cron run --rm briefing >> /opt/briefing/data/logs/cron.log 2>&1 # morning-briefing"
+            # cron.log is written by the host shell (the redirect below) while
+            # data/logs belongs to the container's uid. Keeping it in there
+            # meant one directory two different users had to write, and a
+            # chown that broke cron outright. Move any old one out.
+            if [ -f data/logs/cron.log ] && [ ! -f data/cron.log ]; then
+              mv data/logs/cron.log data/cron.log 2>/dev/null \
+                || cp data/logs/cron.log data/cron.log 2>/dev/null || true
+            fi
+
+            # The crontab no longer encodes the schedule or a timezone — it
+            # just runs tick.sh, which reads TZ and BRIEFING_HOUR/DAYS from
+            # .env and decides. CRON_TZ is gone: it is a vendor extension this
+            # box's cron ignores, which is why "0 5" was firing at 05:00
+            # Europe/Berlin and landing at 10:00 in Jakarta. The host's
+            # timezone is now irrelevant to this project.
+            CRON_LINE="*/15 * * * * /opt/briefing/tick.sh >> /opt/briefing/data/cron.log 2>&1 # morning-briefing"
             ( crontab -l 2>/dev/null | grep -v '# morning-briefing$' | grep -v '^CRON_TZ=' || true
-              echo "CRON_TZ=${TZ:-Asia/Jakarta}"
               echo "$CRON_LINE" ) | crontab -
             echo "cron installed:"
-            crontab -l | grep -E '^CRON_TZ=|# morning-briefing$'
+            crontab -l | grep '# morning-briefing$'
 
-            # Belt and braces: CRON_TZ is supported by Debian/Ubuntu cron but
-            # not universally, so check the host clock agrees too.
-            HOST_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo unknown)"
-            if [ "$HOST_TZ" != "${TZ:-Asia/Jakarta}" ]; then
-              echo "WARNING: host timezone is '$HOST_TZ', schedule expects '${TZ:-Asia/Jakarta}'."
-              echo "WARNING: CRON_TZ should cover this, but to be certain run:"
-              echo "WARNING:   sudo timedatectl set-timezone ${TZ:-Asia/Jakarta}"
-            fi
+            # Bind mounts arrive with the host's ownership regardless of what
+            # the image chowned, so a uid mismatch denies every write inside
+            # the container — the failure that made the agent look like it was
+            # producing nothing. Fix it if we can, name it exactly if we cannot.
+            IMG_UID="$(docker image inspect --format '{{.Config.User}}' \
+                       "ghcr.io/fl0rianfischer/morning-briefing:$IMAGE_TAG" 2>/dev/null | cut -d: -f1)"
+            case "$IMG_UID" in ''|*[!0-9]*) IMG_UID=1000 ;; esac
+            for d in data/archive data/logs; do
+              CUR="$(stat -c %u "$d")"
+              if [ "$CUR" != "$IMG_UID" ]; then
+                chown -R "$IMG_UID:$IMG_UID" "$d" 2>/dev/null \
+                  || sudo -n chown -R "$IMG_UID:$IMG_UID" "$d" 2>/dev/null \
+                  || {
+                    echo "WARNING: $d is owned by uid $CUR but the container runs as $IMG_UID."
+                    echo "WARNING: every write inside the container will be denied. Run once:"
+                    echo "WARNING:   sudo chown -R $IMG_UID:$IMG_UID /opt/briefing/data/archive /opt/briefing/data/logs"
+                  }
+              fi
+            done
+
+            echo "next run: $(./tick.sh --dry-run | tail -1)"

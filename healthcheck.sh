@@ -24,7 +24,15 @@ cd "$BRIEFING_DIR" || exit 1
 
 [ -f .env ] && { set -a; . ./.env; set +a; }
 
-EXPECT_TZ="${TZ:-Asia/Jakarta}"
+# Every date below is evaluated in the reader's zone, because that is the only
+# zone the schedule, the filenames and the mail subject are expressed in. The
+# host's own timezone is deliberately not consulted anywhere in this file.
+TZ_SET=1
+if [ -z "${TZ:-}" ]; then TZ_SET=0; TZ=UTC; fi
+export TZ
+
+TODAY="$(date +%F)"
+MAX_ATTEMPTS="${BRIEFING_MAX_ATTEMPTS:-3}"
 FAILED=0
 
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
@@ -35,8 +43,8 @@ echo "morning-briefing health — $(date '+%Y-%m-%d %H:%M:%S %Z')"
 echo
 
 # 1. The briefing itself. This is the check that matters: everything below only
-#    explains a failure here. Cron runs Mon-Fri, so on a Monday the newest file
-#    is legitimately Friday's — three days old.
+#    explains a failure here. The job runs on BRIEFING_DAYS, so on a Monday the
+#    newest file is legitimately Friday's — three days old.
 LATEST="$(ls -1 data/archive/*.md 2>/dev/null | sort | tail -1)"
 if [ -z "$LATEST" ]; then
   fail "no briefings in data/archive/ — nothing has ever run successfully"
@@ -54,45 +62,52 @@ else
   [ "$SIZE" -lt 500 ] && warn "latest briefing is only ${SIZE} bytes — suspiciously short"
 fi
 
-# 2. Schedule. A missing entry is the usual reason for a missing briefing.
+# 2. The timezone, which is the single input the whole schedule derives from.
+#    Empty does not fail loudly at run time — it silently means UTC, which at
+#    05:00 in a UTC+7 zone files the briefing under yesterday's date.
+if [ "$TZ_SET" -eq 0 ]; then
+  fail "TZ is empty in .env — set the TZ repository variable and redeploy"
+else
+  pass "timezone: $TZ (host zone is not consulted)"
+fi
+
+# 3. Schedule. cron fires tick.sh on a fixed interval and tick.sh decides
+#    whether it is briefing time in $TZ, so the crontab itself never changes
+#    and carries no timezone of its own.
 if crontab -l 2>/dev/null | grep -q '# morning-briefing$'; then
-  pass "cron: $(crontab -l | grep '# morning-briefing$' | sed 's| cd /opt.*||')"
+  pass "cron: $(crontab -l | grep '# morning-briefing$' | sed 's| /opt/briefing/tick.sh.*||')"
+  if [ -x tick.sh ]; then
+    DECISION="$(./tick.sh --dry-run 2>&1 | tail -1)"
+    printf '        next: %s\n' "$DECISION"
+  else
+    fail "tick.sh missing or not executable — redeploy"
+  fi
 else
   fail "no cron entry — redeploy to reinstall it"
 fi
 
-# 3. Timezone. Host cron uses the host zone, not the container's; a mismatch
-#    means the briefing arrives hours late rather than not at all, which is
-#    much harder to notice.
-HOST_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo unknown)"
-CRON_TZ_SET="$(crontab -l 2>/dev/null | grep '^CRON_TZ=' | cut -d= -f2)"
-if [ "$HOST_TZ" = "$EXPECT_TZ" ]; then
-  pass "timezone: host $HOST_TZ"
-elif [ "$CRON_TZ_SET" = "$EXPECT_TZ" ]; then
-  warn "host TZ is $HOST_TZ, not $EXPECT_TZ — relying on CRON_TZ=$CRON_TZ_SET"
-else
-  fail "host TZ $HOST_TZ != $EXPECT_TZ and no CRON_TZ — schedule will fire at the wrong hour"
-fi
-
-# 4. Last run's own verdict.
-if [ -f data/logs/cron.log ]; then
-  LAST_RUN="$(grep -E 'starting briefing|FAILED|emailed' data/logs/cron.log | tail -3)"
-  if grep -q 'FAILED' <<< "$(tail -40 data/logs/cron.log)"; then
-    fail "last run logged FAILED:"
-    sed 's/^/        /' <<< "$LAST_RUN"
-  else
-    pass "cron.log tail clean"
-    sed 's/^/        /' <<< "$LAST_RUN"
-  fi
-else
-  warn "no data/logs/cron.log yet — cron has never run"
-fi
-
-# 5. Image. Catches a deploy that built but never pulled.
+# 4. Mount ownership. A bind mount arrives with the host's ownership no matter
+#    what the image chowned, so a uid mismatch makes every write inside the
+#    container fail — and the symptom is an empty log and a run that looks like
+#    the model produced nothing.
 if docker info >/dev/null 2>&1; then
   RUNNING_IMG="$(docker compose --profile cron config 2>/dev/null | awk '/image:/{print $2; exit}')"
   if docker image inspect "$RUNNING_IMG" >/dev/null 2>&1; then
     pass "image present: ${RUNNING_IMG##*/}"
+    IMG_UID="$(docker image inspect --format '{{.Config.User}}' "$RUNNING_IMG" 2>/dev/null | cut -d: -f1)"
+    if [[ "$IMG_UID" =~ ^[0-9]+$ ]]; then
+      for d in data/archive data/logs; do
+        DIR_UID="$(stat -c %u "$d" 2>/dev/null || echo -1)"
+        if [ "$DIR_UID" = "$IMG_UID" ]; then
+          pass "$d owned by uid $DIR_UID, matching the image"
+        else
+          fail "$d is uid $DIR_UID but the container runs as $IMG_UID — writes will be denied"
+          fail "  sudo chown -R $IMG_UID:$IMG_UID $BRIEFING_DIR/data/archive $BRIEFING_DIR/data/logs"
+        fi
+      done
+    else
+      warn "image user is '$IMG_UID', not numeric — cannot verify mount ownership"
+    fi
   else
     fail "image $RUNNING_IMG not pulled — check GHCR auth"
   fi
@@ -100,7 +115,36 @@ else
   fail "docker daemon not responding"
 fi
 
-# 6. Token expiry. It dies silently after a year; see run.sh for why.
+# 5. Last run's own verdict. cron.log lives outside data/logs because the host
+#    shell writes it while the container owns that directory.
+if [ -f data/cron.log ]; then
+  LAST_RUN="$(grep -E 'tick: |starting briefing|FAILED|emailed' data/cron.log | tail -3)"
+  if grep -q 'FAILED' <<< "$(tail -40 data/cron.log)"; then
+    fail "last run logged FAILED:"
+    sed 's/^/        /' <<< "$LAST_RUN"
+  else
+    pass "cron.log tail clean"
+    sed 's/^/        /' <<< "$LAST_RUN"
+  fi
+else
+  warn "no data/cron.log yet — cron has never fired tick.sh"
+fi
+
+# 6. Today's attempts. tick.sh stops retrying after BRIEFING_MAX_ATTEMPTS so a
+#    broken run cannot burn a month of usage limits in one morning — but that
+#    also means a quiet giving-up that nothing else would report.
+ATTEMPTS="$(cat "data/state/$TODAY.attempts" 2>/dev/null || echo 0)"
+[[ "$ATTEMPTS" =~ ^[0-9]+$ ]] || ATTEMPTS=0
+if [ -s "data/archive/$TODAY.md" ]; then
+  pass "today's briefing written ($TODAY)"
+elif [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
+  fail "$ATTEMPTS/$MAX_ATTEMPTS attempts failed today — tick.sh has stopped retrying"
+  fail "  see data/logs/$TODAY.json, then: ./tick.sh --force"
+elif [ "$ATTEMPTS" -gt 0 ]; then
+  warn "$ATTEMPTS/$MAX_ATTEMPTS attempts so far today, no briefing yet"
+fi
+
+# 7. Token expiry. It dies silently after a year; see run.sh for why.
 if [ -n "${CLAUDE_TOKEN_ISSUED:-}" ]; then
   EXPIRES="$(date -d "$CLAUDE_TOKEN_ISSUED +1 year" +%F 2>/dev/null || echo "")"
   if [ -n "$EXPIRES" ]; then
@@ -114,14 +158,22 @@ else
   warn "CLAUDE_TOKEN_ISSUED unset — no expiry warning possible"
 fi
 
-# 7. Disk. Old images are the thing that actually fills a small box.
+# 8. Mail configuration. Empty here means the briefing is written and then
+#    silently not delivered, which looks identical to the job never running.
+if [ -z "${MAIL_FROM:-}" ] || [ -z "${MAIL_TO:-}" ]; then
+  fail "MAIL_FROM/MAIL_TO empty — briefings will be written but not emailed"
+else
+  pass "mail: $MAIL_FROM -> $MAIL_TO"
+fi
+
+# 9. Disk. Old images are the thing that actually fills a small box.
 DISK_PCT="$(df -P . | awk 'NR==2{gsub(/%/,"",$5); print $5}')"
 if [ "$DISK_PCT" -lt 85 ]; then pass "disk ${DISK_PCT}% used"
 elif [ "$DISK_PCT" -lt 95 ]; then warn "disk ${DISK_PCT}% used — try 'docker image prune -a'"
 else fail "disk ${DISK_PCT}% used"
 fi
 
-# 8. Optional live auth probe.
+# 10. Optional live auth probe.
 if [ "${1:-}" = "--probe" ]; then
   if docker compose --profile cron run --rm --entrypoint claude briefing \
        -p "Reply with OK and nothing else." --model haiku 2>/dev/null | grep -qi ok; then

@@ -8,3 +8,7 @@ logs
 data
 README.md
 docker-compose.yml
+
+# Host-side scripts: cron runs these on the box, not in the container
+tick.sh
+healthcheck.sh

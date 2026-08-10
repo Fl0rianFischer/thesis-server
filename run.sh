@@ -21,6 +21,12 @@ cd "$BRIEFING_DIR"
 MODEL="${BRIEFING_MODEL:-sonnet}"
 EFFORT="${BRIEFING_EFFORT:-medium}"
 MAX_TURNS="${BRIEFING_MAX_TURNS:-40}"
+
+# TZ decides the filename, the mail subject and the agent's sense of "today",
+# so an empty one does not fail — it quietly files the briefing under the wrong
+# date. At 05:00 in a UTC+7 zone that is yesterday.
+TZ_MISSING=0
+if [ -z "${TZ:-}" ]; then TZ_MISSING=1; export TZ=UTC; fi
 DATE="$(date +%F)"
 
 mkdir -p archive logs
@@ -28,6 +34,27 @@ mkdir -p archive logs
 # %Y-%m-%dT%H:%M:%S%z rather than -Is: BSD date (macOS, where you'll test
 # locally) has no -Is.
 log() { printf '%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$*"; }
+
+# An `[ ... ] && log ...` one-liner would abort the whole run under `set -e`
+# whenever the condition is false, which here is the healthy case.
+if [ "$TZ_MISSING" -eq 1 ]; then
+  log "WARNING: TZ is empty — using UTC. Set the TZ variable and redeploy."
+fi
+
+# archive/ and logs/ are bind mounts, and a bind mount arrives with the host's
+# ownership regardless of what the Dockerfile chowned. When those uids do not
+# line up, the first symptom is `> logs/$DATE.json: Permission denied` and a
+# run that appears to have produced nothing — which reads exactly like a model
+# failure. Name the real cause instead.
+for dir in archive logs; do
+  if ! touch "$dir/.write-test" 2>/dev/null; then
+    log "FAILED: $dir/ is not writable by uid $(id -u):$(id -g) inside the container."
+    log "FAILED: the bind mount is owned by another uid. On the host, run:"
+    log "FAILED:   sudo chown -R 1000:1000 /opt/briefing/data/archive /opt/briefing/data/logs"
+    exit 1
+  fi
+  rm -f "$dir/.write-test"
+done
 
 # --allowedTools deliberately excludes Bash. This agent reads untrusted web
 # content every morning; delivery is handled below by this script instead, so a
@@ -44,7 +71,9 @@ log() { printf '%s %s\n' "$(date +%Y-%m-%dT%H:%M:%S%z)" "$*"; }
 if [ -n "${CLAUDE_TOKEN_ISSUED:-}" ]; then
   IFS=- read -r _ty _tm _td <<< "$CLAUDE_TOKEN_ISSUED"
   _wy=$((10#$_ty + 1)); _wm=$((10#$_tm - 1))
-  [ "$_wm" -eq 0 ] && { _wm=12; _wy=$((_wy - 1)); }
+  # if/fi, not `[ ... ] && { ... }`: under `set -e` the one-liner form aborts
+  # the entire run for the eleven months of the year when the test is false.
+  if [ "$_wm" -eq 0 ]; then _wm=12; _wy=$((_wy - 1)); fi
   if [[ "$DATE" > "$(printf '%04d-%02d-%02d' "$_wy" "$_wm" "$((10#$_td))")" ]]; then
     log "WARNING: OAuth token issued $CLAUDE_TOKEN_ISSUED expires around $((10#$_ty + 1))-$_tm-$_td."
     log "WARNING: run 'claude setup-token', update the CLAUDE_CODE_OAUTH_TOKEN secret, redeploy."
@@ -59,11 +88,26 @@ if [ -n "${ANTHROPIC_API_KEY:-}" ] || [ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]; then
   log "WARNING: subscription token — this run will be billed to the API."
 fi
 
-log "starting briefing for $DATE (model=$MODEL effort=$EFFORT)"
+log "starting briefing for $DATE (model=$MODEL effort=$EFFORT tz=$TZ)"
+
+# The system prompt is prompt.md plus a block of time facts derived from TZ:
+# local time now, when the US session last closed and next opens in the
+# reader's own zone, and what to call it. prompt.md used to state all of that
+# in prose, which made TZ a lie you had to remember to update in two places.
+#
+# Fatal on failure rather than falling back to prompt.md alone: without this
+# block the agent has no date at all, and would date the briefing by guess.
+SYSTEM_PROMPT="$(mktemp)"
+trap 'rm -f "$SYSTEM_PROMPT"' EXIT
+cat prompt.md > "$SYSTEM_PROMPT"
+if ! node context.mjs >> "$SYSTEM_PROMPT"; then
+  log "FAILED: could not build the time context (node context.mjs)"
+  exit 1
+fi
 
 CLAUDE_ARGS=(
   -p "Produce today's briefing."
-  --append-system-prompt-file prompt.md
+  --append-system-prompt-file "$SYSTEM_PROMPT"
   --allowedTools "WebSearch,WebFetch,Read,Write,Glob"
   --model "$MODEL"
   --effort "$EFFORT"
@@ -111,6 +155,15 @@ fi
 
 if ! command -v jq >/dev/null 2>&1; then
   log "jq not installed — briefing written to archive/$DATE.md, not emailed"
+  exit 1
+fi
+
+# Checked here rather than left to curl: Resend rejects an empty `from` with a
+# 422 that -fsS reduces to a bare non-zero exit, so an unset GitHub Variable
+# would look like a delivery outage rather than a missing config value.
+if [ -z "${MAIL_FROM:-}" ] || [ -z "${MAIL_TO:-}" ]; then
+  log "FAILED: briefing written to archive/$DATE.md but not emailed —"
+  log "FAILED: MAIL_FROM/MAIL_TO is empty. Set the GitHub Variables and redeploy."
   exit 1
 fi
 
