@@ -178,7 +178,11 @@ if docker info >/dev/null 2>&1; then
       IMG_UID=""
     fi
   else
-    fail "image $RUNNING_IMG not pulled — check GHCR auth"
+    fail "image not present locally: $RUNNING_IMG"
+    fail "  the deploy pre-pulls this, so either it has not run since the last"
+    fail "  push, or the pull failed — check GHCR auth (docker login ghcr.io)."
+    fail "  A run would still pull it on demand, at 05:00, which is the wrong"
+    fail "  time to find out the credentials expired."
   fi
 else
   fail "docker daemon not responding"
@@ -255,6 +259,25 @@ for a in "${AGENTS[@]}"; do
     warn "$ATTEMPTS/$MAX_ATTEMPTS attempts so far today, no brief yet"
   fi
 
+  # How this agent's last completed run actually ended. Judged on the newest
+  # outcome line for THIS agent rather than on a fixed tail of cron.log: two
+  # agents share that file, and a fixed tail reaches back days on a quiet
+  # weekend, so a long-fixed failure keeps getting reported as current. Lines
+  # written before the per-agent restructure carry no [agent] tag and are
+  # correctly ignored here.
+  LAST_OUTCOME="$(grep -F "[$a]" data/cron.log 2>/dev/null \
+                  | grep -E 'FAILED|emailed|not emailed' | tail -1)"
+  if [ -n "$LAST_OUTCOME" ]; then
+    if grep -q 'FAILED' <<< "$LAST_OUTCOME"; then
+      fail "last completed run failed:"
+      printf '        %s\n' "$LAST_OUTCOME"
+      fail "  see data/$a/logs/, and read the lines above it — Claude's stderr"
+      fail "  is written before the FAILED line, not after it"
+    else
+      pass "last completed run succeeded"
+    fi
+  fi
+
   # A per-agent recipient is optional; empty MAIL_TO with no override means the
   # brief is written and silently never sent.
   _to_var="${PREFIX}_MAIL_TO"
@@ -273,12 +296,13 @@ head2 "Recent activity"
 # cron.log lives outside data/<agent>/logs because the host shell writes it
 # while the container owns those directories. Both agents write here, and every
 # line carries its agent name in brackets.
+#
+# Informational only — deliberately no pass/fail. Whether a run succeeded is
+# decided per agent above, on that agent's newest outcome line. Judging a fixed
+# tail of a file two agents share means an old, already-fixed failure keeps
+# being reported as current, which is how a health check trains you to ignore
+# it.
 if [ -f data/cron.log ]; then
-  if grep -q 'FAILED' <<< "$(tail -60 data/cron.log)"; then
-    fail "a recent run logged FAILED:"
-  else
-    pass "cron.log tail clean"
-  fi
   grep -E 'tick: |starting |FAILED|emailed' data/cron.log | tail -6 | sed 's/^/        /'
 else
   warn "no data/cron.log yet — cron has never fired tick.sh"

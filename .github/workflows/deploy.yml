@@ -230,7 +230,14 @@ jobs:
             ENVEOF
             chmod 600 .env
 
-            docker compose pull
+            # --profile cron is required, not cosmetic: the only service is
+            # behind that profile, and Compose hides profiled services from
+            # every command that does not enable it. A plain `docker compose
+            # pull` matches zero services and exits 0, so the deploy looks
+            # clean while nothing is fetched — the image then gets pulled
+            # lazily by the first `compose run` at 05:00, which is exactly the
+            # wrong time to discover a GHCR auth problem.
+            docker compose --profile cron pull
             docker image prune -f
 
             # cron.log is written by the host shell (the redirect below) while
