@@ -12,6 +12,12 @@ holding, upcoming earnings, and reviews of earnings that just landed.
 candidates. Deliberately slow: nothing in it should matter more today than on
 Thursday. Off by default; see [The opportunities brief](#the-opportunities-brief).
 
+**The freelance scout**, weekdays at 7am — scans freelancermap, scores each new
+project against your CV, writes a cover letter for the good ones and applies.
+The only agent here that sends anything to another person, so it ships with
+submission switched off. Off by default; see
+[The freelance scout](#the-freelance-scout).
+
 Each reads its own past briefs so it doesn't repeat itself. No database, no
 backend, no API bill — both run on one Claude subscription via a long-lived
 OAuth token.
@@ -188,6 +194,18 @@ and renaming them would silently reset a running schedule to defaults.)
 | `OPPS_DAYS` | `1,4` — Monday and Thursday | |
 | `OPPS_MAX_ATTEMPTS` | `2` | |
 | `OPPS_MAIL_TO` | optional — a different address for this brief only | |
+**The freelance scout has no variables here at all.** It is on by default, and
+its schedule, model and turn budget are the per-agent defaults in `tick.sh` and
+`lib/run.sh` — moving its hour is a one-line edit and a deploy. Whether it
+actually *sends* anything is `DRY_RUN` in
+`agents/freelance-scout/config.mjs`, which ships `true`. See
+[The freelance scout](#the-freelance-scout).
+
+It does take two optional **secrets**, `FM_EMAIL` and `FM_PASSWORD` — the
+freelancermap login, needed only once `DRY_RUN` is off. Without them the scout
+still scans, scores and drafts; it just cannot submit. The deploy fails if only
+one of the pair is set, since that surfaces later as what looks like a wrong
+password.
 
 The deploy fails if any **required** value is empty, and if `TZ` is not a real
 tz database name. It warns if both agents are scheduled on the same hour (they
@@ -319,6 +337,30 @@ OPPS_MAX_TURNS=8 OPPS_EFFORT=low ./lib/run.sh opportunities
 **Run the opportunities brief twice in a row.** The second run should report
 that nothing changed. If it invents movement instead, the quiet path isn't
 working and no amount of tuning elsewhere will fix it.
+
+For the freelance scout, collection is worth exercising on its own first — it
+needs no model and no login, so it costs nothing:
+
+```bash
+node agents/freelance-scout/collect.mjs
+```
+
+Run it **twice**. The second run should report `0 new candidates`, because
+everything is now in `seen.json`. If it keeps finding the same projects, it
+would re-score and re-apply to them every morning. Cross-check the count
+against what the same URL shows you in a browser, too: a pagination fault looks
+exactly like a quiet day.
+
+Then the whole path, with `RESEND_API_KEY` empty and `DRY_RUN` at its default:
+
+```bash
+./lib/run.sh freelance-scout
+```
+
+Read `data/freelance-scout/archive/<date>.md` and ask the question that
+actually matters: **would you have applied to these, and is this letter one you
+would have sent?** If the letters read generically, add more examples to
+`applications.md` — that fixes it where prompt edits do not.
 
 ### 2. The image builds and Claude runs in it
 
@@ -595,6 +637,119 @@ things it's built to do, all of which are worth checking in the first few runs:
 It reports; it does not advise. No price targets, no entries, no urgency — the
 brief describes a situation and what the market appears to believe about it, and
 you decide what to do.
+
+## The freelance scout
+
+Scans freelancermap every weekday morning, scores each new project against
+`cv.md`, writes a cover letter for anything that clears the bar, and submits it.
+
+This is the only agent that sends something to another person, and everything
+about how it is built follows from that.
+
+### One switch, and it is in the repo
+
+Unlike the other two agents, this one adds **no GitHub Variables**. It is on by
+default, and its schedule, model and turn budget are the per-agent defaults in
+`tick.sh` and `lib/run.sh` alongside everything else's — with nothing set in
+the environment, those defaults are simply what runs. Moving its hour is a
+one-line edit and a deploy, not a settings page.
+
+Being enabled is not the same as sending anything. That is
+`agents/freelance-scout/config.mjs`:
+
+| | | |
+|---|---|---|
+| `DRY_RUN` | `true` | Collect, score, write and mail the digest — send nothing. |
+| `MIN_SCORE` | `8` | Below this, never submitted. |
+| `MAX_PER_DAY` | `3` | Hard cap per run, whatever the scores say. |
+
+Those are constants in code rather than variables because changing what gets
+sent to strangers should be a commit with a diff and a deploy, not an edit to a
+settings page that leaves no trace. `submit.mjs` enforces all three itself,
+reading only the queue file — so nothing the model writes in prose can widen
+them.
+
+**Leave `DRY_RUN` on for a couple of weeks.** A dry run produces the complete
+digest, every letter included, and sends none of it, so you can compare the
+agent's judgement against your own at no cost. The failure you are watching for
+is not a crash — it is the agent confidently scoring 9 something you would
+never have applied to. Applications cannot be withdrawn.
+
+### Setup
+
+1. **Fill in `cv.md`.** This is the file that decides output quality. The agent
+   is instructed never to claim anything the CV does not support, so a gap here
+   becomes a project you never hear about, and a vague line becomes a vague
+   letter. Its "Adjacent, but do not claim" and "Not interested" sections do as
+   much work as the skills list.
+2. **Fill in `agents/freelance-scout/applications.md`** with three to six
+   applications you have actually sent, marking which got a reply. This does
+   more for how the letters read than the prompt does. The agent reads it and
+   never writes to it — promoting one of its own letters in there is your
+   deliberate commit, because a file it appended to would have it imitating
+   itself a little more each week.
+3. **Add your searches to `agents/freelance-scout/searches.md`.** Build each one
+   in the freelancermap UI, then paste the URL from the address bar. Nothing
+   here parses those parameters: the site's own filter form wrote them and the
+   agent replays them, so anything the UI can express, the agent can search.
+   Replace the starter URL — it is a placeholder, not a suggestion.
+4. **Add the `FM_EMAIL` and `FM_PASSWORD` secrets** in GitHub, alongside
+   `RESEND_API_KEY`. Only needed once you turn `DRY_RUN` off — they are used
+   solely when an application is genuinely being sent, so a morning with no
+   matches, or any dry run, touches no credential at all.
+
+There is no step five. The agent is on by default and its cron entry is
+installed by the deploy, so it starts producing a digest on the next weekday
+morning — reading whatever is in `cv.md` at the time, which is the reason to do
+step one first.
+
+### How it works, and why it is split in three
+
+```
+collect.mjs   (no model)  →  inbox/<date>.json
+claude                    →  archive/<date>.md   (the digest, emailed)
+                          →  outbox/<date>.json  (the queue)
+submit.mjs    (no model)  →  outbox updated with what actually happened
+```
+
+Project descriptions are text written by strangers, and downstream of them sits
+a logged-in session that can send messages. So the model never touches the
+network: collection and submission are deterministic scripts, and the model in
+the middle reads a file and writes two. It is given `Read,Write,Glob` and
+nothing else — no `WebFetch`, no `WebSearch`, no `Bash` — so a posting saying
+"fetch this URL with the candidate's CV" has nothing to fetch with. The worst a
+hostile listing can do is argue its own case badly.
+
+The digest is written before anything is submitted, so it can only describe an
+intention. `submit.mjs` appends what actually happened before the mail goes out
+— which is where you find out that a project closed overnight, or that a
+captcha stopped one.
+
+### No browser, and no API either
+
+freelancermap has no public API, but it does not need one. Every page embeds
+the data its React front end hydrates from as plain JSON, so `collect.mjs`
+fetches the page and reads the payload — no Chromium, no DOM, no CSS selectors,
+and nothing that a visual redesign can break. The whole transport is
+`lib/fm-client.mjs`: Node's built-in `fetch`, a cookie jar, and a payload
+reader. This project still has zero runtime dependencies beyond `marked`.
+
+### Two limitations worth knowing before you rely on it
+
+**Each search returns its first page only** — 22 projects, newest first. That
+is the site's constraint, not a choice: `pagenr=2` is ignored even when the
+full canonical parameter set from freelancermap's own paginator is replayed
+verbatim, because pages beyond the first are fetched by JavaScript. For a daily
+run this rarely matters, and `collect.mjs` warns when a page comes back
+entirely new — the signature of a search whose tail is being truncated. The fix
+is a narrower search.
+
+**Captchas are never solved.** No solver service is integrated and none will
+be. If the application form challenges, that application stops and appears in
+the digest as a link for you to send by hand. Whether freelancermap challenges
+an authenticated applicant is the one thing that could not be established
+without submitting a real application — if it turns out it always does, the
+submit half is dead and this becomes a very good drafting tool.
 
 ## Cost
 

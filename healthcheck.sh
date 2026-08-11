@@ -34,7 +34,7 @@ export TZ
 TODAY="$(date +%F)"
 FAILED=0
 
-AGENTS=(morning-briefing opportunities)
+AGENTS=(morning-briefing opportunities freelance-scout)
 
 pass() { printf '  \033[32mPASS\033[0m  %s\n' "$*"; }
 warn() { printf '  \033[33mWARN\033[0m  %s\n' "$*"; }
@@ -80,6 +80,16 @@ agent_cfg() {
       # Runs Mon and Thu, so the longest healthy gap is Thursday read on
       # Monday — four days. Anything past a week means it has stopped.
       STALE_WARN=4; STALE_FAIL=7 ;;
+    freelance-scout)
+      # On by default, and these defaults are what runs: this agent adds no
+      # GitHub Variables, so nothing sets SCOUT_* in .env.
+      PREFIX=SCOUT; ENABLED_DEFAULT=1
+      HOUR_DEFAULT=7; DAYS_DEFAULT="1-5"; ATTEMPTS_DEFAULT=2
+      # Weekdays, like the morning briefing: Friday's digest read on Monday is
+      # three days and healthy. A digest is written even on a morning with no
+      # matching projects, so a genuine gap here means the run is failing, not
+      # that the market is quiet.
+      STALE_WARN=3; STALE_FAIL=5 ;;
   esac
   ENABLED="$(env_or "${PREFIX}_ENABLED" "$ENABLED_DEFAULT")"
   MAX_ATTEMPTS="$(env_or "${PREFIX}_MAX_ATTEMPTS" "$ATTEMPTS_DEFAULT")"

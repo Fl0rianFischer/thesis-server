@@ -55,6 +55,8 @@ jobs:
           CLAUDE_TOKEN_ISSUED: ${{ vars.CLAUDE_TOKEN_ISSUED }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          FM_EMAIL: ${{ secrets.FM_EMAIL }}
+          FM_PASSWORD: ${{ secrets.FM_PASSWORD }}
         run: |
           missing=()
           [ -n "$TZ" ]                      || missing+=("TZ (variable)")
@@ -75,6 +77,23 @@ jobs:
           if [ ! -f "/usr/share/zoneinfo/$TZ" ]; then
             echo "::error::TZ='$TZ' is not a zone in the tz database (try Asia/Jakarta, Europe/Berlin)."
             exit 1
+          fi
+
+          # The freelance scout is the only agent that sends anything to
+          # another person. It needs these only once DRY_RUN is turned off in
+          # agents/freelance-scout/config.mjs, so a missing pair is a warning
+          # rather than an error — a dry run uses no credentials at all.
+          #
+          # Half a credential is checked because that is the failure that would
+          # otherwise surface as a login rejection at 07:00 and read like a
+          # wrong password.
+          if { [ -n "$FM_EMAIL" ] && [ -z "$FM_PASSWORD" ]; } \
+             || { [ -z "$FM_EMAIL" ] && [ -n "$FM_PASSWORD" ]; }; then
+            echo "::error::Only one of FM_EMAIL/FM_PASSWORD is set — set both or neither."
+            exit 1
+          fi
+          if [ -z "$FM_EMAIL" ]; then
+            echo "::warning::FM_EMAIL/FM_PASSWORD unset — the freelance scout can score and draft, but cannot submit."
           fi
 
           for pair in "BRIEFING_HOUR:$BRIEFING_HOUR" "OPPS_HOUR:$OPPS_HOUR"; do
@@ -102,6 +121,8 @@ jobs:
           else
             echo "opportunities present but disabled (set OPPS_ENABLED=1 to turn it on)"
           fi
+          echo "freelance-scout enabled (its schedule and limits live in the repo, not in Variables)"
+          echo "  whether it SENDS anything is DRY_RUN in agents/freelance-scout/config.mjs"
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1
@@ -129,6 +150,10 @@ jobs:
           # Secrets (masked)
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          # The freelancermap login. Used only by agents/freelance-scout, and
+          # only when something is actually being submitted.
+          FM_EMAIL: ${{ secrets.FM_EMAIL }}
+          FM_PASSWORD: ${{ secrets.FM_PASSWORD }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -137,7 +162,7 @@ jobs:
           # same class of bug that once shipped a blank MAIL_FROM: green build,
           # green deploy, and a brief that never arrived. Adding a variable
           # above means adding it here and to the heredoc below.
-          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_HOUR,BRIEFING_DAYS,BRIEFING_MAX_ATTEMPTS,OPPS_ENABLED,OPPS_MAIL_TO,OPPS_MODEL,OPPS_EFFORT,OPPS_MAX_TURNS,OPPS_HOUR,OPPS_DAYS,OPPS_MAX_ATTEMPTS,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY
+          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_HOUR,BRIEFING_DAYS,BRIEFING_MAX_ATTEMPTS,OPPS_ENABLED,OPPS_MAIL_TO,OPPS_MODEL,OPPS_EFFORT,OPPS_MAX_TURNS,OPPS_HOUR,OPPS_DAYS,OPPS_MAX_ATTEMPTS,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY,FM_EMAIL,FM_PASSWORD
           script: |
             set -e
             cd /opt/briefing
@@ -201,8 +226,13 @@ jobs:
             migrate_dir data/archive data/morning-briefing/archive
             migrate_dir data/logs    data/morning-briefing/logs
 
+            # inbox/ and outbox/ are the scout's working files rather than its
+            # memory: today's collected projects, and today's queue with the
+            # outcome of each. archive/ is the memory, as for every agent.
             mkdir -p data/morning-briefing/archive data/morning-briefing/logs \
                      data/opportunities/archive data/opportunities/logs \
+                     data/freelance-scout/archive data/freelance-scout/logs \
+                     data/freelance-scout/inbox data/freelance-scout/outbox \
                      data/state
 
             cat > .env <<ENVEOF
@@ -227,6 +257,8 @@ jobs:
             OPPS_MAX_ATTEMPTS=$OPPS_MAX_ATTEMPTS
             CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN
             RESEND_API_KEY=$RESEND_API_KEY
+            FM_EMAIL=$FM_EMAIL
+            FM_PASSWORD=$FM_PASSWORD
             ENVEOF
             chmod 600 .env
 
@@ -309,6 +341,7 @@ jobs:
                 | grep -v '^CRON_TZ=' || true
               echo "*/15 * * * * /opt/briefing/tick.sh morning-briefing >> /opt/briefing/data/cron.log 2>&1 # briefing-agent"
               echo "*/15 * * * * /opt/briefing/tick.sh opportunities >> /opt/briefing/data/cron.log 2>&1 # briefing-agent"
+              echo "*/15 * * * * /opt/briefing/tick.sh freelance-scout >> /opt/briefing/data/cron.log 2>&1 # briefing-agent"
             } | crontab -
             echo "cron installed:"
             crontab -l | grep '# briefing-agent$'
@@ -327,7 +360,7 @@ jobs:
             IMG_UID="$(docker image inspect --format '{{.Config.User}}' \
                        "ghcr.io/fl0rianfischer/morning-briefing:$IMAGE_TAG" 2>/dev/null | cut -d: -f1)"
             case "$IMG_UID" in ''|*[!0-9]*) IMG_UID=1000 ;; esac
-            for d in data/morning-briefing data/opportunities; do
+            for d in data/morning-briefing data/opportunities data/freelance-scout; do
               CUR="$(stat -c %u "$d")"
               if [ "$CUR" != "$IMG_UID" ]; then
                 chown -R "$IMG_UID:$IMG_UID" "$d" 2>/dev/null \
@@ -335,7 +368,7 @@ jobs:
                   || {
                     echo "WARNING: $d is owned by uid $CUR but the container runs as $IMG_UID."
                     echo "WARNING: every write inside the container will be denied. Run once:"
-                    echo "WARNING:   sudo chown -R $IMG_UID:$IMG_UID /opt/briefing/data/morning-briefing /opt/briefing/data/opportunities"
+                    echo "WARNING:   sudo chown -R $IMG_UID:$IMG_UID /opt/briefing/data/morning-briefing /opt/briefing/data/opportunities /opt/briefing/data/freelance-scout"
                   }
               fi
             done
@@ -344,7 +377,7 @@ jobs:
             # silently, so report what each agent actually has to read. A
             # morning-briefing archive that says 0 briefs on a box that has been
             # running for weeks means the migration did not take.
-            for a in morning-briefing opportunities; do
+            for a in morning-briefing opportunities freelance-scout; do
               echo "$a: $(ls -1 "data/$a/archive"/*.md 2>/dev/null | wc -l | tr -d ' ') past briefs"
             done
             if [ -d data/archive ]; then

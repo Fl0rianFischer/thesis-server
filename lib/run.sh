@@ -30,7 +30,7 @@ cd "$APP_DIR"
 
 AGENT="${1:-}"
 if [ -z "$AGENT" ]; then
-  echo "usage: run.sh <agent>   (morning-briefing | opportunities)" >&2
+  echo "usage: run.sh <agent>   (morning-briefing | opportunities | freelance-scout)" >&2
   exit 2
 fi
 
@@ -47,6 +47,10 @@ fi
 case "$AGENT" in
   morning-briefing) PREFIX=BRIEFING; LABEL="Briefing";      DEFAULT_MAX_TURNS=40 ;;
   opportunities)    PREFIX=OPPS;     LABEL="Opportunities"; DEFAULT_MAX_TURNS=25 ;;
+  # The scout's turn budget is lower than the morning briefing's because it
+  # does no research: its projects arrive in a file, already collected. What it
+  # spends turns on is reading the CV and writing letters.
+  freelance-scout)  PREFIX=SCOUT;    LABEL="Projects";      DEFAULT_MAX_TURNS=30 ;;
   *) echo "run.sh: unknown agent '$AGENT'" >&2; exit 2 ;;
 esac
 
@@ -138,6 +142,22 @@ fi
 
 log "starting $AGENT for $DATE (model=$MODEL effort=$EFFORT turns=$MAX_TURNS tz=$TZ)"
 
+# The scout's projects are gathered before the model starts, by a script with
+# no model in it. That ordering is the security boundary: everything collected
+# here is text written by strangers, and the agent below reads it as a file
+# rather than fetching it — so a hostile project description has no tool to
+# reach for. See the header of agents/freelance-scout/collect.mjs.
+#
+# A failed collection does not abort the run. context.mjs detects the missing
+# inbox and instructs the agent to report a failed scan, which lands in the
+# inbox as a mail — whereas exiting here would burn one of the day's attempts
+# and say nothing to anyone.
+if [ "$AGENT" = "freelance-scout" ]; then
+  if ! node agents/freelance-scout/collect.mjs; then
+    log "WARNING: collection failed — the digest will report a failed scan"
+  fi
+fi
+
 # The system prompt is three parts: the agent's prompt.md, the shared time
 # facts derived from TZ, and the agent's own framing on top. That last part is
 # why context is split — the morning briefing gets a session-close countdown
@@ -163,13 +183,25 @@ fi
 # content; delivery is handled below by this script instead, so a prompt
 # injection in a news article has no shell to reach for.
 #
+# The scout goes further and gets no network tools at all. The two research
+# agents need the web because searching it is their job. The scout's projects
+# arrive in a file that collect.mjs already wrote, so WebSearch and WebFetch
+# would be capability it never uses — and capability it never uses is capability
+# a hostile project description could try to borrow. Without them, a posting
+# that says "fetch this URL with the candidate's CV" has nothing to fetch with.
+#
 # --bare is deliberately NOT used. It would ignore the subscription OAuth token
 # and fall back to ANTHROPIC_API_KEY billing, and it strips WebSearch/WebFetch
-# from the toolset, which is the entire job.
+# from the toolset, which is the entire job for the other two.
+case "$AGENT" in
+  freelance-scout) ALLOWED_TOOLS="Read,Write,Glob" ;;
+  *)               ALLOWED_TOOLS="WebSearch,WebFetch,Read,Write,Glob" ;;
+esac
+
 CLAUDE_ARGS=(
   -p "Produce today's brief."
   --append-system-prompt-file "$SYSTEM_PROMPT"
-  --allowedTools "WebSearch,WebFetch,Read,Write,Glob"
+  --allowedTools "$ALLOWED_TOOLS"
   --model "$MODEL"
   --effort "$EFFORT"
   --max-turns "$MAX_TURNS"
@@ -207,6 +239,29 @@ fi
 
 if command -v jq >/dev/null 2>&1; then
   log "cost: $(log_field total_cost_usd) USD (subscription runs bill no tokens)"
+fi
+
+# Submission runs after the digest exists and before it is mailed, so the mail
+# can state what was actually sent rather than what the agent intended to send.
+# The two differ more often than you would like: a project whose applications
+# closed overnight, a captcha, an expired session.
+#
+# submit.mjs enforces the threshold, the daily cap and DRY_RUN itself, reading
+# only the outbox — nothing the model wrote in prose can widen what it does.
+# Its stdout is a markdown block appended to the digest; its log goes to stderr.
+#
+# A failure here must not lose the digest. The archive already exists and is
+# worth mailing either way, so this warns and continues.
+if [ "$AGENT" = "freelance-scout" ]; then
+  SUBMIT_REPORT="$(mktemp)"
+  if node agents/freelance-scout/submit.mjs > "$SUBMIT_REPORT"; then
+    cat "$SUBMIT_REPORT" >> "$ARCHIVE_DIR/$DATE.md"
+  else
+    log "WARNING: submission step failed — the digest is unchanged and still lists intent"
+    printf '\n---\n\n## Delivery\n\nThe submission step failed. Nothing was sent. See the log.\n' \
+      >> "$ARCHIVE_DIR/$DATE.md"
+  fi
+  rm -f "$SUBMIT_REPORT"
 fi
 
 if [ -z "${RESEND_API_KEY:-}" ]; then

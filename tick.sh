@@ -28,7 +28,7 @@ set -uo pipefail
 APP_DIR="${APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 cd "$APP_DIR" || exit 1
 
-usage() { echo "usage: tick.sh <morning-briefing|opportunities> [--dry-run|--force]" >&2; exit 2; }
+usage() { echo "usage: tick.sh <morning-briefing|opportunities|freelance-scout> [--dry-run|--force]" >&2; exit 2; }
 
 AGENT="${1:-}"
 [ -n "$AGENT" ] || usage
@@ -48,6 +48,21 @@ case "$AGENT" in
   opportunities)
     PREFIX=OPPS;     DEFAULT_ENABLED=0
     DEFAULT_DAYS="1,4"; DEFAULT_HOUR=7; DEFAULT_MAX_ATTEMPTS=2 ;;
+  # Weekdays only: projects are posted during business hours and applying at
+  # 07:00 on a Sunday to something posted on Friday is both late and visibly
+  # automated.
+  #
+  # On by default, unlike the opportunities agent, and these are the values that
+  # actually run — this agent adds no GitHub Variables, so nothing sets SCOUT_*
+  # in .env and env_or falls through to exactly what is written here. Moving the
+  # hour means editing this line.
+  #
+  # Being enabled does not mean anything gets sent: DRY_RUN in
+  # agents/freelance-scout/config.mjs ships true, so an enabled scout with an
+  # unfinished cv.md costs a digest to read and nothing more.
+  freelance-scout)
+    PREFIX=SCOUT;    DEFAULT_ENABLED=1
+    DEFAULT_DAYS="1-5"; DEFAULT_HOUR=7; DEFAULT_MAX_ATTEMPTS=2 ;;
   *) echo "tick.sh: unknown agent '$AGENT'" >&2; usage ;;
 esac
 
