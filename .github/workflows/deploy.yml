@@ -1,5 +1,11 @@
 name: Deploy
 
+# The logic lives in scripts/, not here. A workflow file is the worst place to
+# keep shell: it cannot be run locally, cannot be linted, and every change has
+# to be tested by pushing to main. scripts/check-config.sh and
+# scripts/deploy.sh are ordinary scripts you can read, `bash -n`, and run by
+# hand — this file only decides when they run and what environment they get.
+
 on:
   push:
     branches: [main]
@@ -39,350 +45,60 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
-      # The .env heredoc below writes every value unconditionally, so an unset
-      # variable becomes an empty line rather than an error. That is how the
-      # first working deploy shipped with MAIL_FROM blank: green build, green
-      # deploy, and a briefing that was written every morning and never sent.
-      # Fail here instead, where it is visible.
+      - uses: actions/checkout@v4
+
+      # Nine values, and that is the entire configuration surface of this
+      # project. Everything an agent does — its hour, its days, its model, its
+      # turn budget, whether it runs at all — is a default in tick.sh and
+      # lib/run.sh, versioned with the code that reads it.
+      #
+      # What is left here is only what genuinely cannot live in the repo: where
+      # the deployment is, where mail goes, and the credentials.
       - name: Check required configuration
         env:
           TZ: ${{ vars.TZ }}
           MAIL_FROM: ${{ vars.MAIL_FROM }}
           MAIL_TO: ${{ vars.MAIL_TO }}
-          BRIEFING_HOUR: ${{ vars.BRIEFING_HOUR }}
-          OPPS_HOUR: ${{ vars.OPPS_HOUR }}
-          OPPS_ENABLED: ${{ vars.OPPS_ENABLED }}
           CLAUDE_TOKEN_ISSUED: ${{ vars.CLAUDE_TOKEN_ISSUED }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           FM_EMAIL: ${{ secrets.FM_EMAIL }}
           FM_PASSWORD: ${{ secrets.FM_PASSWORD }}
-        run: |
-          missing=()
-          [ -n "$TZ" ]                      || missing+=("TZ (variable)")
-          [ -n "$MAIL_FROM" ]               || missing+=("MAIL_FROM (variable)")
-          [ -n "$MAIL_TO" ]                 || missing+=("MAIL_TO (variable)")
-          [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] || missing+=("CLAUDE_CODE_OAUTH_TOKEN (secret)")
-          [ -n "$RESEND_API_KEY" ]          || missing+=("RESEND_API_KEY (secret)")
-
-          if [ "${#missing[@]}" -gt 0 ]; then
-            echo "::error::Required configuration is empty. Settings -> Secrets and variables -> Actions."
-            printf '  missing: %s\n' "${missing[@]}"
-            echo "  Note that Secrets and Variables are separate tabs on that page."
-            exit 1
-          fi
-
-          # A typo like Asia/Jakata is not an error anywhere downstream — it
-          # just silently means UTC, and the briefing quietly shifts by hours.
-          if [ ! -f "/usr/share/zoneinfo/$TZ" ]; then
-            echo "::error::TZ='$TZ' is not a zone in the tz database (try Asia/Jakarta, Europe/Berlin)."
-            exit 1
-          fi
-
-          # The freelance scout is the only agent that sends anything to
-          # another person. It needs these only once DRY_RUN is turned off in
-          # agents/freelance-scout/config.mjs, so a missing pair is a warning
-          # rather than an error — a dry run uses no credentials at all.
-          #
-          # Half a credential is checked because that is the failure that would
-          # otherwise surface as a login rejection at 07:00 and read like a
-          # wrong password.
-          if { [ -n "$FM_EMAIL" ] && [ -z "$FM_PASSWORD" ]; } \
-             || { [ -z "$FM_EMAIL" ] && [ -n "$FM_PASSWORD" ]; }; then
-            echo "::error::Only one of FM_EMAIL/FM_PASSWORD is set — set both or neither."
-            exit 1
-          fi
-          if [ -z "$FM_EMAIL" ]; then
-            echo "::warning::FM_EMAIL/FM_PASSWORD unset — the freelance scout can score and draft, but cannot submit."
-          fi
-
-          for pair in "BRIEFING_HOUR:$BRIEFING_HOUR" "OPPS_HOUR:$OPPS_HOUR"; do
-            name="${pair%%:*}"; value="${pair#*:}"
-            if [ -n "$value" ] && ! { [ "$value" -ge 0 ] && [ "$value" -le 23 ]; } 2>/dev/null; then
-              echo "::error::$name='$value' must be an hour 0-23."
-              exit 1
-            fi
-          done
-
-          # The two agents share one subscription's usage limits, and tick.sh
-          # makes a run wait rather than overlap. Scheduling them on the same
-          # hour is therefore not broken, just slower — the second one starts on
-          # a later tick. Worth saying out loud rather than discovering later.
-          if [ -n "$OPPS_HOUR" ] && [ "$OPPS_HOUR" = "${BRIEFING_HOUR:-5}" ]; then
-            echo "::warning::OPPS_HOUR and BRIEFING_HOUR are both $OPPS_HOUR — the second agent will wait for the first and start up to 15 minutes late."
-          fi
-
-          [ -n "$CLAUDE_TOKEN_ISSUED" ] \
-            || echo "::warning::CLAUDE_TOKEN_ISSUED is unset — the OAuth token expires after a year with no warning."
-
-          echo "configuration OK — TZ=$TZ, briefing at ${BRIEFING_HOUR:-5}:00 local"
-          if [ "${OPPS_ENABLED:-0}" = "1" ]; then
-            echo "opportunities enabled, at ${OPPS_HOUR:-7}:00 local"
-          else
-            echo "opportunities present but disabled (set OPPS_ENABLED=1 to turn it on)"
-          fi
-          echo "freelance-scout enabled (its schedule and limits live in the repo, not in Variables)"
-          echo "  whether it SENDS anything is DRY_RUN in agents/freelance-scout/config.mjs"
+        run: ./scripts/check-config.sh
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v1
         env:
           IMAGE_TAG: ${{ github.sha }}
-          # Variables (non-sensitive)
           TZ: ${{ vars.TZ }}
           CLAUDE_TOKEN_ISSUED: ${{ vars.CLAUDE_TOKEN_ISSUED }}
           MAIL_FROM: ${{ vars.MAIL_FROM }}
           MAIL_TO: ${{ vars.MAIL_TO }}
-          BRIEFING_MODEL: ${{ vars.BRIEFING_MODEL }}
-          BRIEFING_EFFORT: ${{ vars.BRIEFING_EFFORT }}
-          BRIEFING_MAX_TURNS: ${{ vars.BRIEFING_MAX_TURNS }}
-          BRIEFING_HOUR: ${{ vars.BRIEFING_HOUR }}
-          BRIEFING_DAYS: ${{ vars.BRIEFING_DAYS }}
-          BRIEFING_MAX_ATTEMPTS: ${{ vars.BRIEFING_MAX_ATTEMPTS }}
-          OPPS_ENABLED: ${{ vars.OPPS_ENABLED }}
-          OPPS_MAIL_TO: ${{ vars.OPPS_MAIL_TO }}
-          OPPS_MODEL: ${{ vars.OPPS_MODEL }}
-          OPPS_EFFORT: ${{ vars.OPPS_EFFORT }}
-          OPPS_MAX_TURNS: ${{ vars.OPPS_MAX_TURNS }}
-          OPPS_HOUR: ${{ vars.OPPS_HOUR }}
-          OPPS_DAYS: ${{ vars.OPPS_DAYS }}
-          OPPS_MAX_ATTEMPTS: ${{ vars.OPPS_MAX_ATTEMPTS }}
-          # Secrets (masked)
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-          # The freelancermap login. Used only by agents/freelance-scout, and
-          # only when something is actually being submitted.
+          # The freelancermap login, used only by agents/freelance-scout and
+          # only once DRY_RUN is off in its config.mjs.
           FM_EMAIL: ${{ secrets.FM_EMAIL }}
           FM_PASSWORD: ${{ secrets.FM_PASSWORD }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # A name missing from this list is silently absent on the box — the
-          # same class of bug that once shipped a blank MAIL_FROM: green build,
-          # green deploy, and a brief that never arrived. Adding a variable
-          # above means adding it here and to the heredoc below.
-          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,BRIEFING_MODEL,BRIEFING_EFFORT,BRIEFING_MAX_TURNS,BRIEFING_HOUR,BRIEFING_DAYS,BRIEFING_MAX_ATTEMPTS,OPPS_ENABLED,OPPS_MAIL_TO,OPPS_MODEL,OPPS_EFFORT,OPPS_MAX_TURNS,OPPS_HOUR,OPPS_DAYS,OPPS_MAX_ATTEMPTS,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY,FM_EMAIL,FM_PASSWORD
+          envs: IMAGE_TAG,TZ,CLAUDE_TOKEN_ISSUED,MAIL_FROM,MAIL_TO,CLAUDE_CODE_OAUTH_TOKEN,RESEND_API_KEY,FM_EMAIL,FM_PASSWORD
+          # A bootstrap, not the deploy. `git pull` is what puts the current
+          # scripts/deploy.sh on the box, so it has to happen before that file
+          # can be run — which is why these three lines stay here and
+          # everything else moved out.
+          #
+          # The exports are explicit rather than inherited: ssh-action injects
+          # `envs` as assignments in this shell, and a child process only sees
+          # what has been exported. Without this the deploy would write an .env
+          # of empty values, which is precisely the failure the check step
+          # exists to prevent.
           script: |
             set -e
             cd /opt/briefing
             git pull --ff-only
-            chmod +x tick.sh healthcheck.sh lib/run.sh
-
-            # One-time migration into the per-agent layout. data/archive is the
-            # morning briefing's memory — each run reads its last few briefs so
-            # it doesn't repeat itself — so losing it would not fail anything, it
-            # would just make every morning start cold.
-            #
-            # A plain `mv data/archive ...` does NOT work here, and the reason is
-            # not obvious: renaming a *directory* into a new parent needs write
-            # permission on the directory being moved, because the kernel has to
-            # update its ".." entry. data/archive is owned by the container's uid
-            # 1000, not by the deploy user, so both parents being writable is not
-            # enough and mv fails with EACCES. (Moving a plain file has no such
-            # requirement, which is why the cron.log move below has always been
-            # fine.) Hence the ladder: rename, rename as root, else copy — copy
-            # needs only read on the source, and leaves the original untouched.
-            #
-            # This never aborts the deploy. A failure here costs one agent its
-            # history; aborting costs BOTH agents their cron entries, because the
-            # code is already pulled and the old crontab line no longer matches
-            # the new tick.sh. Warn loudly and keep going.
-            #
-            # Guarded on the destination being *empty* rather than absent, so a
-            # partial or failed migration is retried on the next deploy instead
-            # of being silently skipped forever.
-            migrate_dir() {
-              src="$1"; dst="$2"
-              if [ ! -d "$src" ]; then return 0; fi
-              if [ -n "$(ls -A "$dst" 2>/dev/null)" ]; then return 0; fi
-
-              mkdir -p "$(dirname "$dst")"
-
-              if [ ! -e "$dst" ] && mv "$src" "$dst" 2>/dev/null; then
-                echo "migrated $src -> $dst"
-                return 0
-              fi
-              if [ ! -e "$dst" ] && sudo -n mv "$src" "$dst" 2>/dev/null; then
-                echo "migrated $src -> $dst (as root)"
-                return 0
-              fi
-
-              mkdir -p "$dst"
-              if cp -a "$src/." "$dst/" 2>/dev/null \
-                 || sudo -n cp -a "$src/." "$dst/" 2>/dev/null; then
-                echo "migrated $src -> $dst by copy"
-                echo "  $src is still there as a backup — delete it once a brief has run"
-                return 0
-              fi
-
-              echo "::warning::could not migrate $src to $dst — that agent starts with no history"
-              echo "WARNING: could not migrate $src to $dst. Deploy continued anyway."
-              echo "WARNING: the agent will run, but with no memory of past briefs. Fix by hand:"
-              echo "WARNING:   sudo mv /opt/briefing/$src /opt/briefing/$dst"
-              return 0
-            }
-
-            migrate_dir data/archive data/morning-briefing/archive
-            migrate_dir data/logs    data/morning-briefing/logs
-
-            # inbox/ and outbox/ are the scout's working files rather than its
-            # memory: today's collected projects, and today's queue with the
-            # outcome of each. archive/ is the memory, as for every agent.
-            mkdir -p data/morning-briefing/archive data/morning-briefing/logs \
-                     data/opportunities/archive data/opportunities/logs \
-                     data/freelance-scout/archive data/freelance-scout/logs \
-                     data/freelance-scout/inbox data/freelance-scout/outbox \
-                     data/state
-
-            cat > .env <<ENVEOF
-            IMAGE_TAG=$IMAGE_TAG
-            TZ=$TZ
-            CLAUDE_TOKEN_ISSUED=$CLAUDE_TOKEN_ISSUED
-            MAIL_FROM=$MAIL_FROM
-            MAIL_TO=$MAIL_TO
-            BRIEFING_MODEL=$BRIEFING_MODEL
-            BRIEFING_EFFORT=$BRIEFING_EFFORT
-            BRIEFING_MAX_TURNS=$BRIEFING_MAX_TURNS
-            BRIEFING_HOUR=$BRIEFING_HOUR
-            BRIEFING_DAYS=$BRIEFING_DAYS
-            BRIEFING_MAX_ATTEMPTS=$BRIEFING_MAX_ATTEMPTS
-            OPPS_ENABLED=$OPPS_ENABLED
-            OPPS_MAIL_TO=$OPPS_MAIL_TO
-            OPPS_MODEL=$OPPS_MODEL
-            OPPS_EFFORT=$OPPS_EFFORT
-            OPPS_MAX_TURNS=$OPPS_MAX_TURNS
-            OPPS_HOUR=$OPPS_HOUR
-            OPPS_DAYS=$OPPS_DAYS
-            OPPS_MAX_ATTEMPTS=$OPPS_MAX_ATTEMPTS
-            CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN
-            RESEND_API_KEY=$RESEND_API_KEY
-            FM_EMAIL=$FM_EMAIL
-            FM_PASSWORD=$FM_PASSWORD
-            ENVEOF
-            chmod 600 .env
-
-            # --profile cron is required, not cosmetic: the only service is
-            # behind that profile, and Compose hides profiled services from
-            # every command that does not enable it. A plain `docker compose
-            # pull` matches zero services and exits 0, so the deploy looks
-            # clean while nothing is fetched — the image then gets pulled
-            # lazily by the first `compose run` at 05:00, which is exactly the
-            # wrong time to discover a GHCR auth problem.
-            #
-            # Retried, and non-fatal. GHCR applies a secondary rate limit when
-            # several deploys land close together — each one pulls a fresh
-            # image tag — and answers with a 403 whose body says to wait and
-            # try again. That is transient and must not fail a deploy: pulling
-            # here is an optimisation, not a requirement, because `compose run`
-            # still pulls on demand exactly as it did before this step existed.
-            # Failing hard would trade a real improvement for a new outage.
-            PULL_LOG="$(mktemp)"
-            PULLED=0
-            for attempt in 1 2 3; do
-              if docker compose --profile cron pull > "$PULL_LOG" 2>&1; then
-                PULLED=1
-                break
-              fi
-              tail -3 "$PULL_LOG"
-              if grep -qi 'rate limit\|secondary rate' "$PULL_LOG"; then
-                echo "GHCR secondary rate limit on attempt $attempt/3 — transient, not an auth problem"
-              fi
-              if [ "$attempt" -lt 3 ]; then
-                echo "retrying in $((attempt * 60))s"
-                sleep $((attempt * 60))
-              fi
-            done
-            rm -f "$PULL_LOG"
-
-            if [ "$PULLED" -eq 1 ]; then
-              echo "image pulled: $IMAGE_TAG"
-            else
-              echo "::warning::could not pre-pull the image — the next scheduled run will pull it on demand"
-              echo "WARNING: could not pre-pull ghcr.io/fl0rianfischer/morning-briefing:$IMAGE_TAG"
-              echo "WARNING: the deploy is otherwise complete and the schedule is installed."
-              echo "WARNING: the next run pulls on demand, so this self-heals if the cause was"
-              echo "WARNING: a rate limit. If it was auth, that run fails instead — to settle it"
-              echo "WARNING: now, on the box:  docker compose --profile cron pull"
-            fi
-
-            docker image prune -f
-
-            # cron.log is written by the host shell (the redirect below) while
-            # data/logs belongs to the container's uid. Keeping it in there
-            # meant one directory two different users had to write, and a
-            # chown that broke cron outright. Move any old one out.
-            if [ -f data/logs/cron.log ] && [ ! -f data/cron.log ]; then
-              mv data/logs/cron.log data/cron.log 2>/dev/null \
-                || cp data/logs/cron.log data/cron.log 2>/dev/null || true
-            fi
-
-            # One line per agent. The crontab still encodes no schedule and no
-            # timezone — each line just runs tick.sh for one agent, and tick.sh
-            # reads TZ and that agent's HOUR/DAYS from .env and decides.
-            # CRON_TZ is gone: it is a vendor extension this box's cron
-            # ignores, which is why "0 5" was firing at 05:00 Europe/Berlin and
-            # landing at 10:00 in Jakarta. The host's timezone is irrelevant to
-            # this project.
-            #
-            # Both lines are always installed. A disabled agent is disabled by
-            # OPPS_ENABLED in .env, not by withholding its cron entry — so
-            # turning it on is a variable change rather than a crontab edit,
-            # and `tick.sh opportunities --dry-run` can explain itself either
-            # way.
-            #
-            # The legacy '# morning-briefing' tag is stripped too: the old
-            # single line called tick.sh with no agent argument, which the new
-            # tick.sh rejects.
-            {
-              crontab -l 2>/dev/null \
-                | grep -v '# briefing-agent$' \
-                | grep -v '# morning-briefing$' \
-                | grep -v '^CRON_TZ=' || true
-              echo "*/15 * * * * /opt/briefing/tick.sh morning-briefing >> /opt/briefing/data/cron.log 2>&1 # briefing-agent"
-              echo "*/15 * * * * /opt/briefing/tick.sh opportunities >> /opt/briefing/data/cron.log 2>&1 # briefing-agent"
-              echo "*/15 * * * * /opt/briefing/tick.sh freelance-scout >> /opt/briefing/data/cron.log 2>&1 # briefing-agent"
-            } | crontab -
-            echo "cron installed:"
-            crontab -l | grep '# briefing-agent$'
-
-            # Bind mounts arrive with the host's ownership regardless of what
-            # the image chowned, so a uid mismatch denies every write inside
-            # the container — the failure that made the agent look like it was
-            # producing nothing. Fix it if we can, name it exactly if we cannot.
-            #
-            # ONLY the per-agent trees. data/ is one mount now, but it also
-            # holds data/state (attempts and locks, written by tick.sh on the
-            # host) and data/cron.log (written by cron's own redirect). A
-            # blanket `chown -R data` would hand those to the container's uid
-            # and break cron's append — the same shape as the bug that had
-            # cron.log living in data/logs.
-            IMG_UID="$(docker image inspect --format '{{.Config.User}}' \
-                       "ghcr.io/fl0rianfischer/morning-briefing:$IMAGE_TAG" 2>/dev/null | cut -d: -f1)"
-            case "$IMG_UID" in ''|*[!0-9]*) IMG_UID=1000 ;; esac
-            for d in data/morning-briefing data/opportunities data/freelance-scout; do
-              CUR="$(stat -c %u "$d")"
-              if [ "$CUR" != "$IMG_UID" ]; then
-                chown -R "$IMG_UID:$IMG_UID" "$d" 2>/dev/null \
-                  || sudo -n chown -R "$IMG_UID:$IMG_UID" "$d" 2>/dev/null \
-                  || {
-                    echo "WARNING: $d is owned by uid $CUR but the container runs as $IMG_UID."
-                    echo "WARNING: every write inside the container will be denied. Run once:"
-                    echo "WARNING:   sudo chown -R $IMG_UID:$IMG_UID /opt/briefing/data/morning-briefing /opt/briefing/data/opportunities /opt/briefing/data/freelance-scout"
-                  }
-              fi
-            done
-
-            # The migration above is the one step that can degrade something
-            # silently, so report what each agent actually has to read. A
-            # morning-briefing archive that says 0 briefs on a box that has been
-            # running for weeks means the migration did not take.
-            for a in morning-briefing opportunities freelance-scout; do
-              echo "$a: $(ls -1 "data/$a/archive"/*.md 2>/dev/null | wc -l | tr -d ' ') past briefs"
-            done
-            if [ -d data/archive ]; then
-              echo "note: the pre-migration data/archive is still on disk as a backup"
-            fi
-
-            echo "next morning-briefing: $(./tick.sh morning-briefing --dry-run | tail -1)"
-            echo "next opportunities:    $(./tick.sh opportunities --dry-run | tail -1)"
+            export IMAGE_TAG TZ CLAUDE_TOKEN_ISSUED MAIL_FROM MAIL_TO
+            export CLAUDE_CODE_OAUTH_TOKEN RESEND_API_KEY FM_EMAIL FM_PASSWORD
+            exec bash scripts/deploy.sh

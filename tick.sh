@@ -46,7 +46,7 @@ case "$AGENT" in
     PREFIX=BRIEFING; DEFAULT_ENABLED=1
     DEFAULT_DAYS="1-5"; DEFAULT_HOUR=5; DEFAULT_MAX_ATTEMPTS=3 ;;
   opportunities)
-    PREFIX=OPPS;     DEFAULT_ENABLED=0
+    PREFIX=OPPS;     DEFAULT_ENABLED=1
     DEFAULT_DAYS="1,4"; DEFAULT_HOUR=7; DEFAULT_MAX_ATTEMPTS=2 ;;
   # Weekdays only: projects are posted during business hours and applying at
   # 07:00 on a Sunday to something posted on Friday is both late and visibly

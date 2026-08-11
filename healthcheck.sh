@@ -75,7 +75,7 @@ agent_cfg() {
       # Runs weekdays, so on a Monday the newest file is legitimately Friday's.
       STALE_WARN=3; STALE_FAIL=5 ;;
     opportunities)
-      PREFIX=OPPS; ENABLED_DEFAULT=0
+      PREFIX=OPPS; ENABLED_DEFAULT=1
       HOUR_DEFAULT=7; DAYS_DEFAULT="1,4"; ATTEMPTS_DEFAULT=2
       # Runs Mon and Thu, so the longest healthy gap is Thursday read on
       # Monday — four days. Anything past a week means it has stopped.
