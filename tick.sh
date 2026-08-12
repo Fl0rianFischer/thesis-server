@@ -44,10 +44,10 @@ AGENT="${1:-}"
 case "$AGENT" in
   morning-briefing)
     PREFIX=BRIEFING; DEFAULT_ENABLED=1
-    DEFAULT_DAYS="1-5"; DEFAULT_HOUR=5; DEFAULT_MAX_ATTEMPTS=3 ;;
+    DEFAULT_DAYS="1-5"; DEFAULT_HOURS=5; DEFAULT_MAX_ATTEMPTS=3 ;;
   opportunities)
     PREFIX=OPPS;     DEFAULT_ENABLED=1
-    DEFAULT_DAYS="1,4"; DEFAULT_HOUR=7; DEFAULT_MAX_ATTEMPTS=2 ;;
+    DEFAULT_DAYS="1,4"; DEFAULT_HOURS=7; DEFAULT_MAX_ATTEMPTS=2 ;;
   # Weekdays only: projects are posted during business hours and applying at
   # 07:00 on a Sunday to something posted on Friday is both late and visibly
   # automated.
@@ -60,9 +60,17 @@ case "$AGENT" in
   # Being enabled does not mean anything gets sent: DRY_RUN in
   # agents/freelance-scout/config.mjs ships true, so an enabled scout with an
   # unfinished cv.md costs a digest to read and nothing more.
+  # Twice a day. Postings are answered within hours on this platform and the
+  # agent only applies to things under 24h old, so one look a day means seeing
+  # half of them too late. Morning catches the overnight European postings;
+  # evening catches the ones posted during the European working day.
+  #
+  # Two runs a day means two artifacts a day — see RUN_SLOT below, without
+  # which the second run would find the first one's file and decide the day
+  # was already done.
   freelance-scout)
     PREFIX=SCOUT;    DEFAULT_ENABLED=1
-    DEFAULT_DAYS="1-5"; DEFAULT_HOUR=7; DEFAULT_MAX_ATTEMPTS=2 ;;
+    DEFAULT_DAYS="1-5"; DEFAULT_HOURS="8,18"; DEFAULT_MAX_ATTEMPTS=2 ;;
   *) echo "tick.sh: unknown agent '$AGENT'" >&2; usage ;;
 esac
 
@@ -87,7 +95,7 @@ set -a; . ./.env; set +a
 export TZ="${TZ:-UTC}"
 
 env_or() { local v="${PREFIX}_$1"; echo "${!v:-$2}"; }
-HOUR="$(env_or HOUR "$DEFAULT_HOUR")"
+HOURS="$(env_or HOURS "$DEFAULT_HOURS")"
 DAYS="$(env_or DAYS "$DEFAULT_DAYS")"
 MAX_ATTEMPTS="$(env_or MAX_ATTEMPTS "$DEFAULT_MAX_ATTEMPTS")"
 ENABLED="$(env_or ENABLED "$DEFAULT_ENABLED")"
@@ -121,6 +129,43 @@ day_matches() {
   return 1
 }
 
+# Which of today's scheduled hours this tick belongs to: the latest one that
+# has already arrived. Empty means the first slot is still ahead of us.
+#
+# An agent with one hour behaves exactly as before — SLOT stays empty and every
+# filename below is unchanged, which is what keeps the two market agents'
+# existing archives readable.
+current_slot() {
+  local spec="$1" now="$2" best="" h
+  local -a hs
+  IFS=, read -ra hs <<< "$spec"
+  for h in "${hs[@]}"; do
+    h="$((10#${h// /}))"
+    if [ "$now" -ge "$h" ] && { [ -z "$best" ] || [ "$h" -gt "$best" ]; }; then best="$h"; fi
+  done
+  printf '%s' "$best"
+}
+
+MULTI_SLOT=0
+[[ "$HOURS" == *,* ]] && MULTI_SLOT=1
+
+SLOT_HOUR="$(current_slot "$HOURS" "$NOW_HOUR")"
+# Zero-padded, because it lands in a filename that gets sorted as text: an
+# unpadded "8" would sort after "18" and the newest-brief lookups would be wrong.
+SLOT=""
+[ "$MULTI_SLOT" -eq 1 ] && [ -n "$SLOT_HOUR" ] && SLOT="$(printf '%02d' "$SLOT_HOUR")"
+
+# RUN_SLOT is what run.sh and lib/context.mjs read to name the artifact, so the
+# evening run writes its own file instead of finding the morning's and
+# concluding the day is finished.
+if [ -n "$SLOT" ]; then
+  ARTIFACT_BASE="$TODAY-$SLOT"
+  STATE_KEY="$AGENT-$TODAY-$SLOT"
+else
+  ARTIFACT_BASE="$TODAY"
+  STATE_KEY="$AGENT-$TODAY"
+fi
+
 mkdir -p data/state "$ARTIFACT"
 
 if [ "$DRY_RUN" -eq 1 ]; then
@@ -128,11 +173,14 @@ if [ "$DRY_RUN" -eq 1 ]; then
   echo "enabled      $ENABLED (${PREFIX}_ENABLED)"
   echo "timezone     $TZ"
   echo "now          $TODAY $(date +%H:%M) (day $DOW)"
-  echo "schedule     ${HOUR}:00 on days $DAYS"
-  echo "artifact     $ARTIFACT/$TODAY.md"
+  echo "schedule     $(echo "$HOURS" | sed 's/,/:00, /g'):00 on days $DAYS"
+  echo "artifact     $ARTIFACT/$ARTIFACT_BASE.md"
+  [ "$MULTI_SLOT" -eq 1 ] && echo "slot         ${SLOT:-none yet today}"
 fi
 
-ATTEMPTS_FILE="data/state/$AGENT-$TODAY.attempts"
+# Per slot, not per day: a morning that failed twice must not leave the evening
+# run with no attempts left before it has tried once.
+ATTEMPTS_FILE="data/state/$STATE_KEY.attempts"
 ATTEMPTS="$(cat "$ATTEMPTS_FILE" 2>/dev/null || echo 0)"
 [[ "$ATTEMPTS" =~ ^[0-9]+$ ]] || ATTEMPTS=0
 
@@ -143,13 +191,13 @@ if [ "$FORCE" -eq 0 ]; then
   [ "$ENABLED" = "1" ] || reason "${PREFIX}_ENABLED is not 1"
 
   day_matches "$DOW" "$DAYS" || reason "day $DOW is not in $DAYS"
-  [ "$NOW_HOUR" -lt "$((10#$HOUR))" ] && reason "local hour $NOW_HOUR is before $HOUR"
+  [ -n "$SLOT_HOUR" ] || reason "local hour $NOW_HOUR is before the first scheduled hour ($HOURS)"
 
   # The artifact is the idempotency key, the same signal run.sh uses to decide
   # whether a run succeeded. If today's brief exists, today is done — no
   # separate "have I run yet" state to drift out of sync with reality. Each
   # agent has its own, so neither can mark the other's day complete.
-  [ -s "$ARTIFACT/$TODAY.md" ] && reason "$ARTIFACT/$TODAY.md already written"
+  [ -s "$ARTIFACT/$ARTIFACT_BASE.md" ] && reason "$ARTIFACT/$ARTIFACT_BASE.md already written"
 
   # Without a cap, a failing run (expired token, say) retries every 15 minutes
   # until midnight and empties a month of usage limits into the void. The
@@ -157,7 +205,7 @@ if [ "$FORCE" -eq 0 ]; then
   # other's budget.
   if [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
     if [ "$ATTEMPTS" -eq "$MAX_ATTEMPTS" ] && [ "$DRY_RUN" -eq 0 ]; then
-      log "tick: giving up for $TODAY after $ATTEMPTS failed attempts — see data/$AGENT/logs/$TODAY.json"
+      log "tick: giving up for $ARTIFACT_BASE after $ATTEMPTS failed attempts — see data/$AGENT/logs/$ARTIFACT_BASE.json"
       echo "$((ATTEMPTS + 1))" > "$ATTEMPTS_FILE"   # so this logs once, not 96 times
     fi
     reason "$ATTEMPTS attempts already failed today (max $MAX_ATTEMPTS)"
@@ -201,7 +249,7 @@ else
 fi
 
 echo "$((ATTEMPTS + 1))" > "$ATTEMPTS_FILE"
-log "tick: starting run for $TODAY (attempt $((ATTEMPTS + 1))/$MAX_ATTEMPTS, TZ=$TZ)"
+log "tick: starting run for $ARTIFACT_BASE (attempt $((ATTEMPTS + 1))/$MAX_ATTEMPTS, TZ=$TZ)"
 
 # Both fds above survive the exec, so the locks are held for the whole run.
-exec "$DOCKER" compose --profile cron run --rm agent "$AGENT"
+exec "$DOCKER" compose --profile cron run --rm -e RUN_SLOT="$SLOT" agent "$AGENT"

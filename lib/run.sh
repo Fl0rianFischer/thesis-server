@@ -86,6 +86,19 @@ TZ_MISSING=0
 if [ -z "${TZ:-}" ]; then TZ_MISSING=1; export TZ=UTC; fi
 DATE="$(date +%F)"
 
+# An agent scheduled more than once a day gets one artifact per slot, so the
+# evening run does not collide with the morning's file. tick.sh sets RUN_SLOT
+# to the zero-padded hour ("08", "18"); it is empty for once-a-day agents, whose
+# filenames are therefore exactly what they always were.
+SLOT="${RUN_SLOT:-}"
+if [ -n "$SLOT" ]; then
+  ARTIFACT_BASE="$DATE-$SLOT"
+  SUBJECT_SUFFIX=" ${SLOT}:00"
+else
+  ARTIFACT_BASE="$DATE"
+  SUBJECT_SUFFIX=""
+fi
+
 mkdir -p "$ARCHIVE_DIR" "$LOG_DIR"
 
 # %Y-%m-%dT%H:%M:%S%z rather than -Is: BSD date (macOS, where you'll test
@@ -207,7 +220,7 @@ CLAUDE_ARGS=(
   --max-turns "$MAX_TURNS"
 )
 
-LOG_FILE="$LOG_DIR/$DATE.json"
+LOG_FILE="$LOG_DIR/$ARTIFACT_BASE.json"
 
 if [ "$STREAM" = "1" ]; then
   # Local tuning: show the run as it happens so you can see which searches it
@@ -231,8 +244,8 @@ fi
 # single JSON object from --output-format json, or NDJSON from stream mode.
 log_field() { jq -rs "[.[] | select(.$1 != null)] | last.$1 // \"n/a\"" "$LOG_FILE" 2>/dev/null; }
 
-if [ ! -s "$ARCHIVE_DIR/$DATE.md" ]; then
-  log "FAILED: no brief at $ARCHIVE_DIR/$DATE.md"
+if [ ! -s "$ARCHIVE_DIR/$ARTIFACT_BASE.md" ]; then
+  log "FAILED: no brief at $ARCHIVE_DIR/$ARTIFACT_BASE.md"
   log "last result: $(log_field result | head -c 500)"
   exit 1
 fi
@@ -255,22 +268,22 @@ fi
 if [ "$AGENT" = "freelance-scout" ]; then
   SUBMIT_REPORT="$(mktemp)"
   if node agents/freelance-scout/submit.mjs > "$SUBMIT_REPORT"; then
-    cat "$SUBMIT_REPORT" >> "$ARCHIVE_DIR/$DATE.md"
+    cat "$SUBMIT_REPORT" >> "$ARCHIVE_DIR/$ARTIFACT_BASE.md"
   else
     log "WARNING: submission step failed — the digest is unchanged and still lists intent"
     printf '\n---\n\n## Delivery\n\nThe submission step failed. Nothing was sent. See the log.\n' \
-      >> "$ARCHIVE_DIR/$DATE.md"
+      >> "$ARCHIVE_DIR/$ARTIFACT_BASE.md"
   fi
   rm -f "$SUBMIT_REPORT"
 fi
 
 if [ -z "${RESEND_API_KEY:-}" ]; then
-  log "RESEND_API_KEY unset — brief written to $ARCHIVE_DIR/$DATE.md, not emailed"
+  log "RESEND_API_KEY unset — brief written to $ARCHIVE_DIR/$ARTIFACT_BASE.md, not emailed"
   exit 0
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
-  log "jq not installed — brief written to $ARCHIVE_DIR/$DATE.md, not emailed"
+  log "jq not installed — brief written to $ARCHIVE_DIR/$ARTIFACT_BASE.md, not emailed"
   exit 1
 fi
 
@@ -278,7 +291,7 @@ fi
 # 422 that -fsS reduces to a bare non-zero exit, so an unset GitHub Variable
 # would look like a delivery outage rather than a missing config value.
 if [ -z "${MAIL_FROM:-}" ] || [ -z "$MAIL_TO" ]; then
-  log "FAILED: brief written to $ARCHIVE_DIR/$DATE.md but not emailed —"
+  log "FAILED: brief written to $ARCHIVE_DIR/$ARTIFACT_BASE.md but not emailed —"
   log "FAILED: MAIL_FROM/${PREFIX}_MAIL_TO/MAIL_TO is empty. Set the GitHub Variables and redeploy."
   exit 1
 fi
@@ -292,7 +305,7 @@ fi
 # wrapper alone still leaves `##` rendering at the browser's default h2 — huge,
 # black, and nothing like the rest of the mail.
 HTML_BODY=""
-if ! HTML_BODY="$(node lib/to_html.mjs "$ARCHIVE_DIR/$DATE.md")"; then
+if ! HTML_BODY="$(node lib/to_html.mjs "$ARCHIVE_DIR/$ARTIFACT_BASE.md")"; then
   HTML_BODY=""
   log "WARNING: HTML render failed — sending plain text only (npm ci?)"
 fi
@@ -300,8 +313,8 @@ fi
 jq -n \
   --arg from "$MAIL_FROM" \
   --arg to "$MAIL_TO" \
-  --arg subject "$LABEL — $DATE" \
-  --arg text "$(cat "$ARCHIVE_DIR/$DATE.md")" \
+  --arg subject "$LABEL — $DATE$SUBJECT_SUFFIX" \
+  --arg text "$(cat "$ARCHIVE_DIR/$ARTIFACT_BASE.md")" \
   --arg html "$HTML_BODY" \
   '{from: $from, to: [$to], subject: $subject, text: $text}
    + (if $html == "" then {} else {html: $html} end)' \

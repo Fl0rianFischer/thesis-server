@@ -12,7 +12,7 @@ holding, upcoming earnings, and reviews of earnings that just landed.
 candidates. Deliberately slow: nothing in it should matter more today than on
 Thursday. See [The opportunities brief](#the-opportunities-brief).
 
-**The freelance scout**, weekdays at 7am — scans freelancermap, scores each new
+**The freelance scout**, weekdays at 8am and 6pm — scans freelancermap, scores each new
 project against your CV, writes a cover letter for the good ones and applies.
 The only agent here that sends anything to another person, so while the agent
 itself is on by default, *submission* ships switched off: it writes the full
@@ -170,7 +170,7 @@ To rotate: re-run `claude setup-token`, update the secret, bump
 
 | Variable | Example | |
 |---|---|---|
-| `TZ` | `Asia/Jakarta` | **required** |
+| `TZ` | `Asia/Makassar` | **required** |
 | `MAIL_FROM` | `briefing@yourdomain.example` | **required** |
 | `MAIL_TO` | `you@example.com` | **required** |
 | `CLAUDE_TOKEN_ISSUED` | `2026-08-06` (date you ran `claude setup-token`) | |
@@ -654,10 +654,31 @@ you decide what to do.
 ## The freelance scout
 
 Scans freelancermap every weekday morning, scores each new project against
-`cv.md`, writes a cover letter for anything that clears the bar, and submits it.
+`agents/freelance-scout/cv.md`, writes a cover letter for anything that clears the bar, and submits it.
 
 This is the only agent that sends something to another person, and everything
 about how it is built follows from that.
+
+### Twice a day
+
+It runs at **08:00 and 18:00** in `TZ`, weekdays. Postings on freelancermap are
+answered within hours, and the agent only applies to things under 24 hours old,
+so a single daily look would see half of them too late. The morning run catches
+what was posted overnight in Europe; the evening run catches the European
+working day.
+
+Two runs a day means two artifacts a day. `tick.sh` passes `RUN_SLOT` (`08` or
+`18`) into the container, and every file of a run carries it —
+`archive/2026-08-12-18.md`, and the same stem for the inbox, outbox and log.
+Without that the evening run would find the morning's file and conclude the day
+was already done. The outbox matters most: the monthly allowance is counted from
+those files, so an overwritten one would lose an application from the count.
+
+Agents that run once a day are unaffected — `RUN_SLOT` is empty for them and
+their filenames are exactly what they always were.
+
+The evening run reads the morning's digest as prior history, so it will not
+re-propose what the morning already covered.
 
 ### One switch, and it is in the repo
 
@@ -690,7 +711,7 @@ never have applied to. Applications cannot be withdrawn.
 
 ### Setup
 
-1. **Fill in `cv.md`.** This is the file that decides output quality. The agent
+1. **Fill in `agents/freelance-scout/cv.md`.** This is the file that decides output quality. The agent
    is instructed never to claim anything the CV does not support, so a gap here
    becomes a project you never hear about, and a vague line becomes a vague
    letter. Its "Adjacent, but do not claim" and "Not interested" sections do as
@@ -713,7 +734,7 @@ never have applied to. Applications cannot be withdrawn.
 
 There is no step five. The agent is on by default and its cron entry is
 installed by the deploy, so it starts producing a digest on the next weekday
-morning — reading whatever is in `cv.md` at the time, which is the reason to do
+morning — reading whatever is in `agents/freelance-scout/cv.md` at the time, which is the reason to do
 step one first.
 
 ### How it works, and why it is split in three
@@ -746,6 +767,23 @@ fetches the page and reads the payload — no Chromium, no DOM, no CSS selectors
 and nothing that a visual redesign can break. The whole transport is
 `lib/fm-client.mjs`: Node's built-in `fetch`, a cookie jar, and a payload
 reader. This project still has zero runtime dependencies beyond `marked`.
+
+### What it will not touch
+
+**Public sector.** Government agencies, ministries, federal and state
+authorities, municipal administration, defence, and anything procured through a
+public tender. Dropped at collection by the keyword list in `config.mjs` and
+gated again by `cv.md`, so it never reaches a letter.
+
+The keywords there are all full phrases, and that is deliberate rather than
+fussy. Measured against real postings, the obvious short German stems are
+unusable: `land` matches *Deutschland*, `kommun` matches *Kommunikation*, `amt`
+matches *gesamt*. Any of them would have silently deleted good projects, and the
+only symptom would have been a slightly shorter digest.
+
+**Anything over 24 hours old.** `MAX_PROJECT_AGE_HOURS` in `config.mjs`,
+enforced twice — once at collection, and again at submission, because a run
+that starts at 17:58 can carry a posting over the line while the model works.
 
 ### Two limitations worth knowing before you rely on it
 

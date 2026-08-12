@@ -71,12 +71,12 @@ agent_cfg() {
   case "$1" in
     morning-briefing)
       PREFIX=BRIEFING; ENABLED_DEFAULT=1
-      HOUR_DEFAULT=5; DAYS_DEFAULT="1-5"; ATTEMPTS_DEFAULT=3
+      HOURS_DEFAULT=5; DAYS_DEFAULT="1-5"; ATTEMPTS_DEFAULT=3
       # Runs weekdays, so on a Monday the newest file is legitimately Friday's.
       STALE_WARN=3; STALE_FAIL=5 ;;
     opportunities)
       PREFIX=OPPS; ENABLED_DEFAULT=1
-      HOUR_DEFAULT=7; DAYS_DEFAULT="1,4"; ATTEMPTS_DEFAULT=2
+      HOURS_DEFAULT=7; DAYS_DEFAULT="1,4"; ATTEMPTS_DEFAULT=2
       # Runs Mon and Thu, so the longest healthy gap is Thursday read on
       # Monday — four days. Anything past a week means it has stopped.
       STALE_WARN=4; STALE_FAIL=7 ;;
@@ -84,7 +84,7 @@ agent_cfg() {
       # On by default, and these defaults are what runs: this agent adds no
       # GitHub Variables, so nothing sets SCOUT_* in .env.
       PREFIX=SCOUT; ENABLED_DEFAULT=1
-      HOUR_DEFAULT=7; DAYS_DEFAULT="1-5"; ATTEMPTS_DEFAULT=2
+      HOURS_DEFAULT="8,18"; DAYS_DEFAULT="1-5"; ATTEMPTS_DEFAULT=2
       # Weekdays, like the morning briefing: Friday's digest read on Monday is
       # three days and healthy. A digest is written even on a morning with no
       # matching projects, so a genuine gap here means the run is failing, not
@@ -93,7 +93,7 @@ agent_cfg() {
   esac
   ENABLED="$(env_or "${PREFIX}_ENABLED" "$ENABLED_DEFAULT")"
   MAX_ATTEMPTS="$(env_or "${PREFIX}_MAX_ATTEMPTS" "$ATTEMPTS_DEFAULT")"
-  HOUR="$(env_or "${PREFIX}_HOUR" "$HOUR_DEFAULT")"
+  HOURS="$(env_or "${PREFIX}_HOURS" "$HOURS_DEFAULT")"
   DAYS="$(env_or "${PREFIX}_DAYS" "$DAYS_DEFAULT")"
 }
 
@@ -254,22 +254,25 @@ for a in "${AGENTS[@]}"; do
   if [ -z "$LATEST" ]; then
     fail "no briefs in data/$a/archive/ — nothing has ever run successfully"
   else
-    LATEST_DATE="$(basename "$LATEST" .md)"
+    # Filenames are YYYY-MM-DD.md, or YYYY-MM-DD-HH.md for an agent that runs
+    # more than once a day. Only the date parses as a date.
+    LATEST_NAME="$(basename "$LATEST" .md)"
+    LATEST_DATE="${LATEST_NAME:0:10}"
     LATEST_AT="$(to_epoch "$LATEST_DATE")"
     SIZE=$(wc -c < "$LATEST" | tr -d ' ')
     if [ -z "$LATEST_AT" ]; then
-      warn "latest brief $LATEST_DATE (${SIZE} bytes) — could not parse its date to age it"
+      warn "latest brief $LATEST_NAME (${SIZE} bytes) — could not parse its date to age it"
     else
       AGE=$(( ( $(date +%s) - LATEST_AT ) / 86400 ))
-      if   [ "$AGE" -le "$STALE_WARN" ]; then pass "latest brief $LATEST_DATE (${AGE}d old, ${SIZE} bytes)"
-      elif [ "$AGE" -le "$STALE_FAIL" ]; then warn "latest brief $LATEST_DATE is ${AGE}d old — expected one within ${STALE_WARN}d"
-      else fail "latest brief $LATEST_DATE is ${AGE}d old — this agent has stopped"
+      if   [ "$AGE" -le "$STALE_WARN" ]; then pass "latest brief $LATEST_NAME (${AGE}d old, ${SIZE} bytes)"
+      elif [ "$AGE" -le "$STALE_FAIL" ]; then warn "latest brief $LATEST_NAME is ${AGE}d old — expected one within ${STALE_WARN}d"
+      else fail "latest brief $LATEST_NAME is ${AGE}d old — this agent has stopped"
       fi
     fi
     [ "$SIZE" -lt 500 ] && warn "latest brief is only ${SIZE} bytes — suspiciously short"
   fi
 
-  printf '        schedule: %s:00 on days %s\n' "$HOUR" "$DAYS"
+  printf '        schedule: %s on days %s\n' "$(echo "$HOURS" | sed 's/,/:00, /g'):00" "$DAYS"
   if [ -x tick.sh ]; then
     printf '        next: %s\n' "$(./tick.sh "$a" --dry-run 2>&1 | tail -1)"
   fi
@@ -278,10 +281,12 @@ for a in "${AGENTS[@]}"; do
   # cannot burn a month of usage limits in one morning — but that also means a
   # quiet giving-up that nothing else would report. Per agent, so one failing
   # agent never implicates the other.
-  ATTEMPTS="$(cat "data/state/$a-$TODAY.attempts" 2>/dev/null || echo 0)"
+  ATTEMPTS="$(cat "data/state/$a-$TODAY"*.attempts 2>/dev/null | sort -n | tail -1)"
+  [ -n "$ATTEMPTS" ] || ATTEMPTS=0
   [[ "$ATTEMPTS" =~ ^[0-9]+$ ]] || ATTEMPTS=0
-  if [ -s "data/$a/archive/$TODAY.md" ]; then
-    pass "today's brief written ($TODAY)"
+  TODAY_COUNT="$(ls -1 "data/$a/archive/$TODAY"*.md 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "${TODAY_COUNT:-0}" -gt 0 ]; then
+    pass "today's brief written ($TODAY, ${TODAY_COUNT} run(s))"
   elif [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
     fail "$ATTEMPTS/$MAX_ATTEMPTS attempts failed today — tick.sh has stopped retrying"
     fail "  see data/$a/logs/$TODAY.json, then: ./tick.sh $a --force"
@@ -306,6 +311,89 @@ for a in "${AGENTS[@]}"; do
     else
       pass "last completed run succeeded"
     fi
+  fi
+
+  # ------------------------------------------------ freelance-scout only ----
+  #
+  # This agent has state the other two do not: a submission switch, a monthly
+  # allowance, a login session, and applications that can end up waiting for a
+  # human. Every one of those fails quietly — a digest still arrives on time
+  # and looks completely normal while nothing is being submitted — so they are
+  # checked here rather than left to be noticed weeks later.
+  if [ "$a" = "freelance-scout" ]; then
+    SCOUT_CFG="agents/freelance-scout/config.mjs"
+
+    # A grep, not node: this runs on the host, which has docker and a git
+    # checkout but is not required to have node. Safe only because config.mjs
+    # keeps one `export const NAME = value;` per line, which its header says.
+    scout_const() {
+      sed -n "s/^export const $1 = \"\{0,1\}\([^\";]*\)\"\{0,1\};.*/\1/p" "$SCOUT_CFG" 2>/dev/null | head -1
+    }
+
+    DRY="$(scout_const DRY_RUN)"
+    MONTH_CAP="$(scout_const MAX_PER_MONTH)"
+    [[ "$MONTH_CAP" =~ ^[0-9]+$ ]] || MONTH_CAP=0
+
+    # Whether anything is actually being sent. Stated either way, because both
+    # states are wrong to be in by accident: a dry run that was meant to end
+    # weeks ago sends nothing, and a live run nobody remembers enabling sends
+    # to real people.
+    if [ "$DRY" = "true" ]; then
+      warn "DRY_RUN is on — digests are written, nothing is submitted"
+      printf '        turn it off in %s when the scoring has earned it\n' "$SCOUT_CFG"
+    elif [ "$DRY" = "false" ]; then
+      pass "live — applications at or above the score threshold are submitted"
+    else
+      fail "cannot read DRY_RUN from $SCOUT_CFG — has its formatting changed?"
+    fi
+
+    # Credentials only matter once it is live. Missing them during a dry run is
+    # the expected state and says nothing.
+    if [ "$DRY" = "false" ]; then
+      if [ -z "${FM_EMAIL:-}" ] || [ -z "${FM_PASSWORD:-}" ]; then
+        fail "live, but FM_EMAIL/FM_PASSWORD are not both set — every submission will fail"
+      else
+        pass "freelancermap credentials present"
+      fi
+    fi
+
+    # The monthly allowance, counted the same way submit.mjs counts it: from
+    # the outbox files, which are the record. grep rather than jq — nothing
+    # else in this script needs jq and the box need not have it.
+    MONTH="$(date +%Y-%m)"
+    SENT_THIS_MONTH="$(cat "data/$a/outbox/$MONTH-"*.json 2>/dev/null | grep -c '"result": "sent"')"
+    [[ "$SENT_THIS_MONTH" =~ ^[0-9]+$ ]] || SENT_THIS_MONTH=0
+    if [ "$MONTH_CAP" -gt 0 ]; then
+      LEFT=$(( MONTH_CAP - SENT_THIS_MONTH ))
+      if   [ "$LEFT" -le 0 ]; then warn "monthly allowance spent: $SENT_THIS_MONTH/$MONTH_CAP used — nothing more will be sent until $(date -d "$(date +%Y-%m-01) +1 month" +%Y-%m-01 2>/dev/null || echo "next month")"
+      elif [ "$LEFT" -le 2 ]; then warn "monthly allowance nearly spent: $SENT_THIS_MONTH/$MONTH_CAP used, $LEFT left"
+      else pass "monthly allowance: $SENT_THIS_MONTH/$MONTH_CAP used, $LEFT left"
+      fi
+      printf '        applications you send by hand also count at freelancermap but not here\n'
+    fi
+
+    # A session that has lapsed is invisible until the next thing it tries to
+    # send, so its age is worth seeing before then.
+    if [ -f data/state/fm-session.json ]; then
+      S_AGE=$(( ( $(date +%s) - $(stat -c %Y data/state/fm-session.json 2>/dev/null || stat -f %m data/state/fm-session.json 2>/dev/null || date +%s) ) / 86400 ))
+      pass "freelancermap session saved ${S_AGE}d ago (renewed automatically when it lapses)"
+    elif [ "$DRY" = "false" ]; then
+      printf '        no saved session yet — the next submission logs in and creates one\n'
+    fi
+
+    # Applications the agent could not finish on its own — a captcha on the
+    # form, a project that closed overnight. These wait for a person, and
+    # nothing else reports them: the digest that mentioned one has long since
+    # been read and archived.
+    STUCK="$(grep -l '"result": "needs_human"' "data/$a/outbox/"*.json 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${STUCK:-0}" -gt 0 ]; then
+      warn "$STUCK day(s) have applications waiting for you to send by hand:"
+      grep -l '"result": "needs_human"' "data/$a/outbox/"*.json 2>/dev/null \
+        | while read -r f; do printf '        %s\n' "$(basename "$f" .json)"; done
+    fi
+
+    FAILED_SUBS="$(cat "data/$a/outbox/$MONTH-"*.json 2>/dev/null | grep -c '"result": "failed"')"
+    [ "${FAILED_SUBS:-0}" -gt 0 ] && warn "$FAILED_SUBS submission(s) failed this month — check the outbox files for the reason"
   fi
 
   # A per-agent recipient is optional; empty MAIL_TO with no override means the

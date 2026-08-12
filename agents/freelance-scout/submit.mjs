@@ -23,9 +23,19 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { readdirSync } from "node:fs";
+
 import { hydrationPayload } from "../../lib/fm-client.mjs";
 import { ensureSession } from "./login.mjs";
-import { DRY_RUN, MIN_SCORE, MAX_PER_DAY } from "./config.mjs";
+import {
+  DRY_RUN,
+  MIN_SCORE,
+  MAX_PER_DAY,
+  MAX_PER_MONTH,
+  EXCEPTIONAL_SCORE,
+  MAX_EXCEPTIONAL_PER_DAY,
+  MAX_PROJECT_AGE_HOURS,
+} from "./config.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = join(HERE, "..", "..");
@@ -40,15 +50,39 @@ function today() {
   }).format(new Date());
 }
 
+// Same stem collect.mjs used, so submit reads the outbox this run wrote rather
+// than an earlier slot's. See runBase() there.
+function runBase(date) {
+  const slot = process.env.RUN_SLOT || "";
+  return slot ? `${date}-${slot}` : date;
+}
+
 // Only the shapes that are actually acted on. A malformed entry is skipped
 // with a reason rather than throwing, so one bad record cannot cost the other
 // two their day — but it is never silently coerced into something sendable.
 function validate(application) {
   if (!Number.isInteger(application?.id)) return "no numeric id";
-  if (typeof application.url !== "string" || !application.url.startsWith("https://www.freelancermap.com/project/")) {
-    // Constructed or rewritten URLs are the thing this check exists for. The
-    // model is told to copy the URL from the inbox verbatim; this is what makes
-    // that instruction load-bearing rather than advisory.
+  // Constructed or rewritten URLs are the thing this check exists for. The
+  // model is told to copy the URL from the inbox verbatim; this is what makes
+  // that instruction load-bearing rather than advisory.
+  //
+  // Both the localised path (/projekt/ on the German site, /project/ on the
+  // English one) and any freelancermap country domain are accepted, because
+  // which one appears depends on which site the search in searches.md points
+  // at. The host is matched exactly rather than by `includes`, so
+  // `freelancermap.com.evil.test` cannot pass.
+  if (typeof application.url !== "string") return "no url";
+  let parsed;
+  try {
+    parsed = new URL(application.url);
+  } catch {
+    return "url is not parseable";
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    !/^www\.freelancermap\.[a-z]{2,3}$/.test(parsed.hostname) ||
+    !/^\/(project|projekt)\/.+/.test(parsed.pathname)
+  ) {
     return "url is not a freelancermap project link";
   }
   if (typeof application.score !== "number") return "no numeric score";
@@ -77,6 +111,22 @@ async function submitOne(client, application, { log }) {
   const payload = hydrationPayload(html, "ProjectShow");
 
   if (!payload) return { status: "failed", detail: "no ProjectShow payload — the URL may be dead" };
+
+  // Re-checked here even though collect.mjs already filtered on age. Collection
+  // runs at the start of a run and submission at the end, and the model in
+  // between takes minutes — long enough for a posting collected at 23h59 to be
+  // over the line by the time anything is sent. Read from the live page rather
+  // than the inbox record, so it is the site's own timestamp that decides.
+  const created = payload.project?.created;
+  if (created) {
+    const ageHours = (Date.now() - new Date(created).getTime()) / 3600000;
+    if (ageHours > MAX_PROJECT_AGE_HOURS) {
+      return {
+        status: "skipped",
+        detail: `posted ${Math.round(ageHours)}h ago, over the ${MAX_PROJECT_AGE_HOURS}h limit`,
+      };
+    }
+  }
   if (!payload.loggedInUser) return { status: "failed", detail: "session is not authenticated on the project page" };
   if (payload.project?.applicationsPaused) return { status: "skipped", detail: "applications are paused on this project" };
   if (payload.project?.disabled) return { status: "skipped", detail: "the project is no longer active" };
@@ -121,8 +171,40 @@ async function submitOne(client, application, { log }) {
   return { status: "failed", detail: `HTTP ${response.status}` };
 }
 
+// How many applications have already gone out this calendar month, counted
+// from the outbox files themselves rather than from a counter.
+//
+// A counter would be a second source of truth that drifts: deleting an outbox
+// file, or restoring the data directory from a backup, would leave it claiming
+// a budget that was never spent. The outbox files *are* the record — one per
+// day, each carrying the outcome of every application in it — so counting them
+// cannot disagree with what happened.
+//
+// Only `sent` counts. Dry runs, skips and failures cost nothing at the platform.
+export function monthlySpend(month, dir = join(DATA, "outbox")) {
+  let spent = 0;
+  let files = [];
+  try {
+    files = readdirSync(dir).filter((f) => f.startsWith(month) && f.endsWith(".json"));
+  } catch {
+    return 0;
+  }
+  for (const file of files) {
+    try {
+      const { results = [] } = JSON.parse(readFileSync(join(dir, file), "utf8"));
+      spent += results.filter((r) => r.result === "sent").length;
+    } catch {
+      // A malformed outbox file is not worth failing the run over, but it does
+      // mean the count is low — say so rather than silently under-counting a
+      // budget that cannot be exceeded safely.
+      console.error(`submit: WARNING could not read ${file} while counting this month's applications`);
+    }
+  }
+  return spent;
+}
+
 export async function submit({ date = today(), log = console.error } = {}) {
-  const outboxPath = join(DATA, "outbox", `${date}.json`);
+  const outboxPath = join(DATA, "outbox", `${runBase(date)}.json`);
 
   let outbox;
   try {
@@ -152,12 +234,59 @@ export async function submit({ date = today(), log = console.error } = {}) {
   }
   eligible.sort((a, b) => b.score - a.score);
 
-  const capped = eligible.slice(MAX_PER_DAY);
-  for (const application of capped) {
-    results.push({ ...application, result: "skipped", detail: `over the daily cap of ${MAX_PER_DAY}` });
+  // Two daily budgets, then one absolute monthly one.
+  //
+  // A 10 draws on its own allowance rather than the ordinary daily cap, so a
+  // perfect project is never dropped for having arrived on the same morning as
+  // another one. Everything below 10 still competes for MAX_PER_DAY.
+  const exceptional = eligible.filter((a) => a.score >= EXCEPTIONAL_SCORE);
+  const ordinary = eligible.filter((a) => a.score < EXCEPTIONAL_SCORE);
+
+  const dayAllowed = [
+    ...exceptional.slice(0, MAX_EXCEPTIONAL_PER_DAY),
+    ...ordinary.slice(0, MAX_PER_DAY),
+  ].sort((a, b) => b.score - a.score);
+
+  const overDaily = [
+    ...exceptional.slice(MAX_EXCEPTIONAL_PER_DAY),
+    ...ordinary.slice(MAX_PER_DAY),
+  ];
+  for (const application of overDaily) {
+    results.push({
+      ...application,
+      result: "skipped",
+      detail:
+        application.score >= EXCEPTIONAL_SCORE
+          ? `over the daily cap of ${MAX_EXCEPTIONAL_PER_DAY} exceptional applications`
+          : `over the daily cap of ${MAX_PER_DAY}`,
+    });
   }
 
-  const toSend = eligible.slice(0, MAX_PER_DAY);
+  // The monthly allowance is the platform's own limit, so nothing overrides it
+  // — not a 10, not anything. Applied last, and to the day's list already
+  // sorted best-first, so a tight budget is spent on the strongest project
+  // rather than on whichever came back first.
+  const spent = monthlySpend(date.slice(0, 7));
+  const remaining = Math.max(0, MAX_PER_MONTH - spent);
+
+  if (remaining === 0) {
+    log(`submit: this month's allowance is spent (${spent}/${MAX_PER_MONTH}) — nothing will be sent`);
+  } else if (spent > 0) {
+    log(`submit: ${spent} of ${MAX_PER_MONTH} applications used this month, ${remaining} left`);
+  }
+
+  for (const application of dayAllowed.slice(remaining)) {
+    results.push({
+      ...application,
+      result: "skipped",
+      detail:
+        remaining === 0
+          ? `this month's allowance of ${MAX_PER_MONTH} is spent`
+          : `only ${remaining} of this month's ${MAX_PER_MONTH} applications remain`,
+    });
+  }
+
+  const toSend = dayAllowed.slice(0, remaining);
 
   if (DRY_RUN) {
     for (const application of toSend) {

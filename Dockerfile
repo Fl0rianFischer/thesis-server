@@ -62,11 +62,10 @@ RUN npm ci --omit=dev \
 # the argument they are invoked with, so a second image would double CI time
 # and pull bandwidth for no isolation gain — the isolation that matters is
 # filesystem, schedule and failure state, and that lives outside the image.
-# cv.md is the freelance scout's equivalent of watchlist.md: the reader's own
-# details, versioned in the image rather than mounted, so a change to what the
-# agent may claim about them is a commit and a deploy like any other.
+# watchlist.md sits at the root because both market agents read it. Everything
+# belonging to a single agent — including the scout's cv.md, which is its
+# equivalent — lives under agents/ and arrives with the COPY below.
 COPY watchlist.md ./watchlist.md
-COPY cv.md ./cv.md
 COPY lib ./lib
 COPY agents ./agents
 

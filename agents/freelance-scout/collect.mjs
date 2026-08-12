@@ -23,9 +23,10 @@ import { fileURLToPath } from "node:url";
 import { FmClient, requirePayload } from "../../lib/fm-client.mjs";
 import {
   RESULTS_PER_PAGE,
-  MAX_PROJECT_AGE_DAYS,
+  MAX_PROJECT_AGE_HOURS,
   EXCLUDED_COMPANIES,
   DEALBREAKER_KEYWORDS,
+  PUBLIC_SECTOR_KEYWORDS,
   MIN_REMOTE_PERCENT,
 } from "./config.mjs";
 
@@ -48,6 +49,18 @@ function today() {
   return parts; // en-CA formats as YYYY-MM-DD
 }
 
+// The stem every file of one run shares: the date, plus the slot when the agent
+// runs more than once a day. tick.sh sets RUN_SLOT.
+//
+// The outbox in particular must carry it. Two runs a day writing one
+// outbox/<date>.json would have the evening overwrite the morning, and since
+// the monthly allowance is counted from those files, a morning application
+// would vanish from the count and the month could be overspent.
+export function runBase(date = today()) {
+  const slot = process.env.RUN_SLOT || "";
+  return slot ? `${date}-${slot}` : date;
+}
+
 // The searches are URLs copied out of the freelancermap UI, so this pulls any
 // line that looks like one and ignores everything else — the file is meant to
 // be readable, with headings and notes around each URL explaining its intent.
@@ -60,9 +73,13 @@ export function parseSearches(markdown) {
   const urls = [];
   for (const line of markdown.split("\n")) {
     if (line.trim().startsWith(">")) continue; // quoted examples, not live searches
-    const match = line.match(/https?:\/\/(?:www\.)?freelancermap\.[a-z]+\/projects\?[^\s)>\]]*/i);
+    // Both spellings of the search path. The German site uses /projekte and the
+    // English one /projects, and they are the same search over the same data —
+    // a URL copied from freelancermap.de would otherwise be silently ignored,
+    // leaving a configured search that simply never runs.
+    const match = line.match(/https?:\/\/(?:www\.)?freelancermap\.[a-z]+\/(?:projects|projekte)\?[^\s)>\]]*/i);
     // A query string is required, and that is a real filter rather than
-    // pedantry: bare /projects is every project on the site. This file
+    // pedantry: the bare path is every project on the site. This file
     // necessarily contains prose about freelancermap.com/projects, and without
     // the `?` a sentence pointing at the search page becomes an unfiltered
     // search that quietly floods the inbox.
@@ -86,12 +103,19 @@ function normaliseSort(url) {
 // vector, plus `translations` and a `matching` block. Keeping them would add
 // roughly 20KB of noise per project to a file whose entire purpose is to be
 // read by a model, so the record is narrowed to what actually decides a match.
-function toRecord(raw) {
+// `origin` is the host of the search that produced this record, and it has to
+// be, because freelancermap localises the project path: a search on
+// freelancermap.de returns links like /projekt/<slug>, and the .com site
+// returns /project/<slug>. The two are not interchangeable — .com/projekt/…
+// is a 404. Hardcoding either origin produces links that look right in the
+// digest and are dead when clicked, and an outbox full of URLs that
+// submit.mjs correctly refuses.
+function toRecord(raw, origin) {
   const remote = raw.projectContractType?.remoteInPercent ?? null;
   return {
     id: raw.id,
     title: raw.title,
-    url: raw.links?.project ? `https://www.freelancermap.com${raw.links.project}` : null,
+    url: raw.links?.project ? `${origin}${raw.links.project}` : null,
     company: raw.company || [raw.firstName, raw.lastName].filter(Boolean).join(" ") || null,
     isEndCustomer: raw.endcustomer ?? false,
     country: raw.country?.name ?? null,
@@ -115,13 +139,21 @@ function toRecord(raw) {
 // from the run log instead of guessed at — "42 collected, 39 dropped: 31 too
 // old" is a debuggable line, "3 projects" is not.
 function rejectionReason(record) {
-  const haystack = `${record.title}\n${record.description}`.toLowerCase();
-
   const company = (record.company ?? "").toLowerCase();
   if (EXCLUDED_COMPANIES.some((c) => company.includes(c.toLowerCase()))) return "excluded company";
 
-  const hit = DEALBREAKER_KEYWORDS.find((k) => haystack.includes(k.toLowerCase()));
+  // Title only — see the note on DEALBREAKER_KEYWORDS in config.mjs. Matching
+  // the description would drop good frontend postings that merely mention
+  // testing, which is a listed strength rather than a dealbreaker.
+  const title = record.title.toLowerCase();
+  const hit = DEALBREAKER_KEYWORDS.find((k) => title.includes(k.toLowerCase()));
   if (hit) return `dealbreaker keyword: ${hit}`;
+
+  // Public sector, which cv.md rules out. Title and description both, because
+  // the client is usually named in the body rather than the title.
+  const body = `${record.title}\n${record.description}`.toLowerCase();
+  const publicSector = PUBLIC_SECTOR_KEYWORDS.find((k) => body.includes(k.toLowerCase()));
+  if (publicSector) return `public sector: ${publicSector}`;
 
   // Only when the site actually reports a figure. A null means the poster did
   // not say, which is a question for the matcher, not grounds for dropping.
@@ -132,11 +164,114 @@ function rejectionReason(record) {
   if (record.expires && new Date(record.expires) < new Date()) return "already expired";
 
   if (record.created) {
-    const age = (Date.now() - new Date(record.created).getTime()) / 86400000;
-    if (age > MAX_PROJECT_AGE_DAYS) return `posted ${Math.round(age)} days ago`;
+    const ageHours = (Date.now() - new Date(record.created).getTime()) / 3600000;
+    if (ageHours > MAX_PROJECT_AGE_HOURS) {
+      // Bucketed rather than exact, so the run log reads "6 posted over 24h
+      // ago" instead of six separate lines differing by minutes.
+      return `posted over ${MAX_PROJECT_AGE_HOURS}h ago`;
+    }
   }
 
   return null;
+}
+
+// --------------------------------------------------------------------------
+// Near-duplicate detection
+// --------------------------------------------------------------------------
+//
+// The same underlying project is routinely posted several times on one morning
+// by different agencies, all shopping the same client brief. They are not
+// caught by the id check — different postings, different ids — and left alone
+// they cost twice over: the model scores the same work repeatedly, and with a
+// submission budget measured in applications per month, two applications to
+// one project is a wasted one.
+//
+// Compared on the description rather than the title, because the title is
+// where recruiters differ most (and where the typos are — one real pair
+// differed only by "Python" versus "Phyton"). Measured on live data, a true
+// duplicate pair scored 0.57 while the nearest unrelated pair scored 0.38, so
+// the threshold sits in that gap. Three genuinely different Angular roles from
+// the same agency scored 0.36 and stay separate, which is the case that
+// matters: merging distinct projects would silently hide one.
+const DUPLICATE_DESCRIPTION = 0.5;
+const DUPLICATE_TITLE = 0.75;
+const SHORT_DESCRIPTION_TOKENS = 25;
+
+function tokenSet(text) {
+  return new Set(
+    (text || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9äöüß]+/gi, " ")
+      .split(/\s+/)
+      // Short words are shared by every German job posting ("und", "mit",
+      // "wir") and only push unrelated pairs together.
+      .filter((word) => word.length >= 4),
+  );
+}
+
+function jaccard(a, b) {
+  if (a.size === 0 || b.size === 0) return 0;
+  let intersection = 0;
+  for (const token of a) if (b.has(token)) intersection++;
+  return intersection / (a.size + b.size - intersection);
+}
+
+function isDuplicate(a, b) {
+  const titleScore = jaccard(a._title, b._title);
+  // A very short description carries too few tokens for the similarity to mean
+  // anything, so the title has to carry the decision on its own.
+  if (a._desc.size < SHORT_DESCRIPTION_TOKENS || b._desc.size < SHORT_DESCRIPTION_TOKENS) {
+    return titleScore >= DUPLICATE_TITLE;
+  }
+  return jaccard(a._desc, b._desc) >= DUPLICATE_DESCRIPTION || titleScore >= DUPLICATE_TITLE;
+}
+
+// Groups near-identical records and returns one representative each, with the
+// others attached as `alsoPostedBy`. That list is not bookkeeping — a brief
+// being shopped by four agencies at once is worth knowing before applying, and
+// the digest says so.
+export function dedupe(records) {
+  const prepared = records.map((r) => ({
+    ...r,
+    _desc: tokenSet(r.description),
+    _title: tokenSet(r.title),
+  }));
+
+  const kept = [];
+  const merged = [];
+
+  for (const record of prepared) {
+    const match = kept.find((k) => isDuplicate(k, record));
+    if (!match) {
+      kept.push(record);
+      continue;
+    }
+
+    // Prefer the end customer over an agency — applying direct is worth more
+    // than applying through a middleman for the same work. Failing that, the
+    // earliest posting, which is most likely the original.
+    const incumbentIsBetter =
+      match.isEndCustomer !== record.isEndCustomer
+        ? match.isEndCustomer
+        : (match.created ?? "") <= (record.created ?? "");
+
+    const winner = incumbentIsBetter ? match : record;
+    const loser = incumbentIsBetter ? record : match;
+
+    if (!incumbentIsBetter) kept[kept.indexOf(match)] = record;
+
+    winner.alsoPostedBy = [
+      ...(winner.alsoPostedBy ?? []),
+      ...(loser.alsoPostedBy ?? []),
+      { company: loser.company, url: loser.url, id: loser.id },
+    ];
+    merged.push(loser.id);
+  }
+
+  // The private token sets never reach the inbox file — they would double its
+  // size and mean nothing to a reader.
+  const clean = kept.map(({ _desc, _title, ...rest }) => rest);
+  return { candidates: clean, mergedIds: merged };
 }
 
 function loadSeen() {
@@ -173,12 +308,13 @@ export async function collect({ log = console.error } = {}) {
 
     const payload = requirePayload(await client.getHtml(url), "ProjectSearch");
     const results = payload.initialResults ?? [];
+    const origin = new URL(url).origin;
 
     let unseenOnPage = 0;
 
     for (const raw of results) {
       stats.fetched++;
-      const record = toRecord(raw);
+      const record = toRecord(raw, origin);
 
       if (seen.has(record.id) || byId.has(record.id)) {
         stats.alreadySeen++;
@@ -217,7 +353,15 @@ export async function collect({ log = console.error } = {}) {
     }
   }
 
-  const candidates = [...byId.values()].sort((a, b) => (b.created ?? "").localeCompare(a.created ?? ""));
+  const { candidates: deduped, mergedIds } = dedupe([...byId.values()]);
+  const candidates = deduped.sort((a, b) => (b.created ?? "").localeCompare(a.created ?? ""));
+
+  // Merged postings are marked seen so the same brief under a different
+  // agency's name does not come back tomorrow as something new.
+  for (const id of mergedIds) seen.add(id);
+  if (mergedIds.length > 0) {
+    log(`collect: merged ${mergedIds.length} duplicate posting(s) of projects already in today's list`);
+  }
 
   const rejectedSummary = Object.entries(stats.rejected)
     .map(([reason, n]) => `${n} ${reason}`)
@@ -235,11 +379,12 @@ export async function collect({ log = console.error } = {}) {
 // as lib/context.mjs.
 if (import.meta.url === `file://${process.argv[1]}`) {
   const date = today();
+  const base = runBase(date);
   const { candidates, seen, warnings } = await collect();
 
   mkdirSync(join(DATA, "inbox"), { recursive: true });
   writeFileSync(
-    join(DATA, "inbox", `${date}.json`),
+    join(DATA, "inbox", `${base}.json`),
     JSON.stringify({ date, collected: new Date().toISOString(), warnings, candidates }, null, 2),
   );
 
@@ -255,5 +400,5 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   for (const candidate of candidates) seen.add(candidate.id);
   writeFileSync(SEEN_FILE, JSON.stringify({ updated: new Date().toISOString(), ids: [...seen] }, null, 2));
 
-  console.error(`collect: wrote ${candidates.length} candidates to data/freelance-scout/inbox/${date}.json`);
+  console.error(`collect: wrote ${candidates.length} candidates to data/freelance-scout/inbox/${base}.json`);
 }

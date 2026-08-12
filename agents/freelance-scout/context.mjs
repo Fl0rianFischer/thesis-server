@@ -23,7 +23,12 @@ const ARCHIVE = process.env.AGENT_ARCHIVE || `${DATA}/archive`;
 const now = new Date();
 const today = fields(now, TZ).date;
 
-const inboxPath = `${DATA}/inbox/${today}.json`;
+// Matches runBase() in collect.mjs and submit.mjs: the date, plus the slot when
+// the agent runs more than once a day.
+const slot = process.env.RUN_SLOT || "";
+const base = slot ? `${today}-${slot}` : today;
+
+const inboxPath = `${DATA}/inbox/${base}.json`;
 let inbox = null;
 try {
   inbox = JSON.parse(readFileSync(inboxPath, "utf8"));
@@ -34,9 +39,17 @@ try {
 let previous = [];
 try {
   previous = readdirSync(ARCHIVE)
-    .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
-    .sort()
-    .filter((f) => f.slice(0, 10) < today);
+    // The optional -HH is the slot, for an agent that runs more than once a day.
+    .filter((f) => /^\d{4}-\d{2}-\d{2}(-\d{2})?\.md$/.test(f))
+    // Sorted on the stem, not the filename. With the extension attached,
+    // "2026-08-12-08.md" sorts before "2026-08-12.md" because "-" precedes
+    // ".", which would put a whole day's digest in the wrong place whenever
+    // slotted and unslotted files coexist.
+    .sort((a, b) => a.replace(/\.md$/, "").localeCompare(b.replace(/\.md$/, "")))
+    // Compared against this run's own stem rather than the date, so the
+    // evening run counts the morning digest as previous. Without that it
+    // re-proposes what the morning already covered, to the same recruiters.
+    .filter((f) => f.replace(/\.md$/, "") < base);
 } catch {
   previous = [];
 }
@@ -59,8 +72,8 @@ if (!inbox) {
     `- Candidates collected this morning: **${n}**.`,
     `- Read them from \`${inboxPath}\`. That file is your only source of projects;`,
     "  do not search the web for more.",
-    `- Write the digest to \`${ARCHIVE}/${today}.md\` and the machine-readable`,
-    `  queue to \`${DATA}/outbox/${today}.json\`. **Both files, every run**, even`,
+    `- Write the digest to \`${ARCHIVE}/${base}.md\` and the machine-readable`,
+    `  queue to \`${DATA}/outbox/${base}.json\`. **Both files, every run**, even`,
     "  when nothing scores well enough to send — an empty queue is still a queue.",
   );
 
@@ -109,11 +122,14 @@ if (previous.length === 0) {
     "- **This is the first digest.** There is no history to compare against.",
   );
 } else {
-  const last = previous[previous.length - 1].slice(0, 10);
-  const gap = daysBetweenDates(last, today);
+  const lastFile = previous[previous.length - 1].replace(/\.md$/, "");
+  const gap = daysBetweenDates(lastFile.slice(0, 10), today);
+  // "earlier today" rather than "0 days ago" — the evening run's most useful
+  // context is usually the digest from this morning.
+  const when = gap === 0 ? "earlier today" : `${gap} day${gap === 1 ? "" : "s"} ago`;
   lines.push(
     "",
-    `- Your last digest was **${last}**, ${gap} day${gap === 1 ? "" : "s"} ago.`,
+    `- Your last digest was **${lastFile}**, ${when}.`,
     `- Read these before writing, newest last: ${previous
       .slice(-3)
       .map((f) => `\`${ARCHIVE}/${f}\``)
