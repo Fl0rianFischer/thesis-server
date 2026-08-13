@@ -54,6 +54,19 @@ case "$AGENT" in
   *) echo "run.sh: unknown agent '$AGENT'" >&2; exit 2 ;;
 esac
 
+# Every agent runs on Sonnet. Stated once, here, rather than left to a fallback
+# buried in the env lookup below — the *_MODEL GitHub Variables are gone, so
+# nothing else in this project can set it and a reader should not have to prove
+# that to themselves.
+#
+# Sonnet on purpose, not as a compromise. All three agents draw on the same
+# subscription and its usage limits are the one genuinely shared resource here
+# (see tick.sh's shared lock), so the model that lets three agents run every day
+# is worth more than a marginally better single brief. If output ever looks
+# thin, raise the turn budget above before reaching for a larger model.
+DEFAULT_MODEL=sonnet
+DEFAULT_EFFORT=medium
+
 PROMPT_FILE="agents/$AGENT/prompt.md"
 AGENT_CONTEXT="agents/$AGENT/context.mjs"
 ARCHIVE_DIR="data/$AGENT/archive"
@@ -68,8 +81,8 @@ fi
 # OPPS_MODEL for the other, with the same line.
 env_or() { local n="$1"; local v="${PREFIX}_$1"; echo "${!v:-$2}"; }
 
-MODEL="$(env_or MODEL sonnet)"
-EFFORT="$(env_or EFFORT medium)"
+MODEL="$(env_or MODEL "$DEFAULT_MODEL")"
+EFFORT="$(env_or EFFORT "$DEFAULT_EFFORT")"
 MAX_TURNS="$(env_or MAX_TURNS "$DEFAULT_MAX_TURNS")"
 STREAM="$(env_or STREAM 0)"
 

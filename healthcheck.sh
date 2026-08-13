@@ -289,7 +289,12 @@ for a in "${AGENTS[@]}"; do
     pass "today's brief written ($TODAY, ${TODAY_COUNT} run(s))"
   elif [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; then
     fail "$ATTEMPTS/$MAX_ATTEMPTS attempts failed today — tick.sh has stopped retrying"
-    fail "  see data/$a/logs/$TODAY.json, then: ./tick.sh $a --force"
+    # Globbed rather than "$TODAY.json": an agent that runs more than once a
+    # day writes logs/<date>-<slot>.json, so the plain name points at a file
+    # that does not exist — precisely when someone is trying to find out why a
+    # run failed.
+    TODAY_LOGS="$(ls -1 "data/$a/logs/$TODAY"*.json 2>/dev/null | tr '\n' ' ')"
+    fail "  see ${TODAY_LOGS:-data/$a/logs/}, then: ./tick.sh $a --force"
   elif [ "$ATTEMPTS" -gt 0 ]; then
     warn "$ATTEMPTS/$MAX_ATTEMPTS attempts so far today, no brief yet"
   fi
