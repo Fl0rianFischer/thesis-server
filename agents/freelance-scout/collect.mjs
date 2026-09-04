@@ -1,7 +1,6 @@
 // Collect today's candidate projects into data/freelance-scout/inbox/<date>.json.
 //
 //   node agents/freelance-scout/collect.mjs
-//   node agents/freelance-scout/collect.mjs --no-session   # ignore any login
 //
 // No model runs here, and that is the point rather than an optimisation.
 // Everything this script reads is text written by strangers — project titles
@@ -12,9 +11,22 @@
 // the model receives this file as data and never fetches anything itself, and
 // the worst a hostile posting can do is argue its own case badly.
 //
-// Runs logged out by default. The public search payload carries everything the
+// Runs logged out, always. The public search payload carries everything the
 // matcher needs, so the session — the one credential in this system — is not
 // touched until something is actually being submitted.
+//
+// That is stated as a property of this script rather than a default, because a
+// default is what it used to be, and the difference cost twelve days of blank
+// digests. Collection loaded data/state/fm-session.json unless --no-session
+// said otherwise, so when the remember-me cookie expired the searches went out
+// carrying it and freelancermap answered with a login wall — a 200 with no
+// ProjectSearch payload — which surfaced as "collection did not run" every
+// morning while the other three agents, none of which hold a credential, went
+// on working and made it look like something specific to this site.
+//
+// A read-only scan of public listings cannot be broken by an expired login if
+// it never presents one. submit.mjs is where the session belongs and where an
+// expired one is worth reporting, because there it is load-bearing.
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -34,8 +46,6 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const APP = join(HERE, "..", "..");
 const DATA = join(APP, "data", "freelance-scout");
 const SEEN_FILE = join(DATA, "seen.json");
-
-const noSession = process.argv.includes("--no-session");
 
 // Local date, in TZ, matching how every other agent names its files. See the
 // note in lib/context.mjs on why this is Intl rather than `date`.
@@ -293,8 +303,7 @@ export async function collect({ log = console.error } = {}) {
     );
   }
 
-  const sessionFile = join(APP, "data", "state", "fm-session.json");
-  const client = noSession ? new FmClient() : FmClient.fromSessionFile(sessionFile);
+  const client = new FmClient();
 
   const seen = loadSeen();
   const coldStart = seen.size === 0;
